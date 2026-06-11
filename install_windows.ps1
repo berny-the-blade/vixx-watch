@@ -17,18 +17,23 @@ Write-Host "vixx-watch dir : $Dir"
 Write-Host "python.exe     : $Py"
 Write-Host "script         : $Script"
 
-# --- Task 1: daily crawl + diff (queues pages for archiving) ---
-$crawlAction = New-ScheduledTaskAction -Execute $Py -Argument "`"$Script`"" -WorkingDirectory $Dir
+$Wrapper = Join-Path $Dir "run_and_publish.ps1"
+$psExe = "powershell.exe"
+
+# --- Task 1: daily crawl + diff (+ publish dashboard) ---
+$crawlAction = New-ScheduledTaskAction -Execute $psExe `
+    -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$Wrapper`"" -WorkingDirectory $Dir
 $crawlTrigger = New-ScheduledTaskTrigger -Daily -At 9:00am
 $crawlSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable -DontStopOnIdleEnd `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
     -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 10)
 Register-ScheduledTask -TaskName "VixxWatch" -Action $crawlAction -Trigger $crawlTrigger `
-    -Settings $crawlSettings -Description "Daily vixx.vn change monitor (crawl + diff)" -Force | Out-Null
+    -Settings $crawlSettings -Description "Daily vixx.vn change monitor (crawl + diff + publish)" -Force | Out-Null
 
-# --- Task 2: spaced-out archiver — one page to Wayback every 2 hours ---
-$arcAction = New-ScheduledTaskAction -Execute $Py -Argument "`"$Script`" --archive" -WorkingDirectory $Dir
+# --- Task 2: spaced-out archiver — one page to Wayback every 2 hours (+ publish) ---
+$arcAction = New-ScheduledTaskAction -Execute $psExe `
+    -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$Wrapper`" -Archive" -WorkingDirectory $Dir
 $arcTrigger = New-ScheduledTaskTrigger -Once -At 9:30am -RepetitionInterval (New-TimeSpan -Hours 2)
 $arcSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable -DontStopOnIdleEnd `

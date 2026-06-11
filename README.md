@@ -32,6 +32,20 @@ crontab -l               # verify
 ```
 Requires only `python3` (standard library — no pip).
 
+## Web dashboard (GitHub Pages)
+Public URL: **https://berny-the-blade.github.io/vixx-watch/** — share with anyone.
+
+Each scheduled run regenerates `docs/index.html` and pushes it, so the page
+auto-updates. It shows:
+- a **banner** (green = no changes / red = changes detected) — the "alert",
+- a **Recent changes** feed (new/removed pages, new/removed links, content
+  edits, sitemap changes) with clickable links,
+- a **Pages** table: every live URL + its latest Wayback snapshot + history,
+- the full **tracked-links** list.
+
+Publishing is done by `run_and_publish.ps1` (called by the scheduled tasks),
+which runs the monitor then commits+pushes `docs/` only when it changed.
+
 ## Notes
 - vixx.vn currently serves an **expired TLS cert**; the crawler skips cert
   verification for vixx.vn only (Wayback uses normal verification).
