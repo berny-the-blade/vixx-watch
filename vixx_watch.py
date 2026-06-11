@@ -46,8 +46,14 @@ ARCHIVE_BATCH = 1          # pages archived per --archive run (spaced by schedul
 
 # ---- news / mentions monitoring ----
 NEWS_KEEP = 80             # articles kept in the dashboard feed
-# Vietnamese crypto outlets spotlighted via site:-scoped queries (edit freely).
+# Vietnamese crypto outlets — Vixex-scoped site: queries (edit freely).
 VN_CRYPTO_SITES = ["coin68.com", "tapchibitcoin.io", "coinnews.vn", "blogtienso.net"]
+# Mainstream VN outlets — broader crypto-asset/market theme (catches regulation
+# & market-context articles that don't name Vixex). Add/remove freely.
+VN_NEWS_SITES = ["vietnamplus.vn", "baotintuc.vn", "diendandoanhnghiep.vn",
+                 "vnexpress.net", "cafef.vn", "tuoitre.vn", "thanhnien.vn"]
+VN_THEME_Q = ('("tài sản mã hóa" OR "tài sản số" OR "sàn giao dịch tài sản" OR '
+              'Vixex OR "tiền mã hóa" OR "tiền số")')
 # Crypto/exchange context used to scope the big corporates so their general
 # news doesn't flood the feed. To track ALL of an entity's news, drop the ctx.
 _CTX = ('(Vixex OR crypto OR "tài sản mã hóa" OR "tài sản số" OR '
@@ -96,6 +102,15 @@ def _app_relevant(name, genre="", extra=""):
         return True
     return False
 
+
+# ---- VIX Securities app watch (separate: incumbent broker; alert if it adds crypto) ----
+SEC_TERMS = ["VIX Securities", "Chứng khoán VIX", "XPower VIX", "Chung khoan VIX"]
+SEC_DEV_RE = re.compile(r"(vix\s*securit|chứng khoán\s*vix|chung khoan\s*vix)", re.I)
+# Crypto signal — deliberately NOT bare "mã hóa" (that means encryption in VN).
+SEC_CRYPTO_RE = re.compile(
+    r"(crypto|tài sản mã hóa|tiền mã hóa|tài sản số|tiền số|tiền điện tử|"
+    r"bitcoin|blockchain|web3|defi)", re.I)
+
 USER_AGENT = "vixx-watch/1.0 (+site change monitor)"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +125,7 @@ TRANSLATE_PER_RUN = 60     # cap VN->EN translations per run (backfills over tim
 APPS_SEEN = os.path.join(DATA_DIR, "apps_seen.json")
 APPS_LOG = os.path.join(DATA_DIR, "apps.jsonl")
 APPS_LATEST = os.path.join(DATA_DIR, "apps_latest.json")
+SEC_FILE = os.path.join(DATA_DIR, "securities.json")   # VIX Securities app watch
 DOCS_DIR = os.path.join(BASE_DIR, "docs")          # GitHub Pages source
 DASHBOARD = os.path.join(DOCS_DIR, "index.html")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # redirects to newest capture
@@ -565,8 +581,14 @@ def fetch_news():
             if status == 200 and not text.startswith("__ERROR__"):
                 collected += parse_feed(text, lang["code"], q["label"], "Google News")
             time.sleep(1.0)
-    for site in VN_CRYPTO_SITES:                # site-scoped VN crypto outlets
+    for site in VN_CRYPTO_SITES:                # Vixex-scoped on crypto outlets
         q = f'"Vixex" OR "VIX Crypto Assets Exchange" site:{site}'
+        _, status, text = fetch(_gnews_url(q, "hl=vi&gl=VN&ceid=VN:vi"), verify=True)
+        if status == 200 and not text.startswith("__ERROR__"):
+            collected += parse_feed(text, "vi", f"site:{site}", site)
+        time.sleep(1.0)
+    for site in VN_NEWS_SITES:                  # broader crypto-market theme
+        q = f"{VN_THEME_Q} site:{site}"
         _, status, text = fetch(_gnews_url(q, "hl=vi&gl=VN&ceid=VN:vi"), verify=True)
         if status == 200 and not text.startswith("__ERROR__"):
             collected += parse_feed(text, "vi", f"site:{site}", site)
@@ -645,21 +667,24 @@ def fetch_news():
 
 
 # ---------------------------------------------------------------- app stores
-def _apple_search(term, country):
+def _itunes_search(term, country, limit=25):
     url = "https://itunes.apple.com/search?" + urllib.parse.urlencode(
-        {"term": term, "country": country, "entity": "software", "limit": 25})
+        {"term": term, "country": country, "entity": "software", "limit": limit})
     _, status, text = fetch(url, verify=True)
-    out = []
     if status == 200 and not text.startswith("__ERROR__"):
         try:
-            data = json.loads(text)
+            return json.loads(text).get("results", [])
         except ValueError:
-            return out
-        for r in data.get("results", []):
-            name = r.get("trackName", "") or ""
-            desc = r.get("description", "") or ""
-            if not _app_relevant(name, r.get("primaryGenreName", "") or "", desc[:400]):
-                continue
+            return []
+    return []
+
+
+def _apple_search(term, country):
+    out = []
+    for r in _itunes_search(term, country):
+        name = r.get("trackName", "") or ""
+        desc = r.get("description", "") or ""
+        if _app_relevant(name, r.get("primaryGenreName", "") or "", desc[:400]):
             out.append({
                 "store": "iOS", "id": "ios:" + str(r.get("bundleId") or r.get("trackId")),
                 "name": name, "developer": r.get("sellerName", "") or "",
@@ -778,6 +803,87 @@ def fetch_apps():
     return new
 
 
+def append_changelog(title, bullets):
+    """Append a dated alert section to changelog.md (shows in the dashboard feed)."""
+    if not bullets:
+        return
+    lines = [f"\n## {now_iso()}", f"\n### {title}"] + [f"- {b}" for b in bullets]
+    with open(CHANGELOG, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def fetch_securities():
+    """Track VIX Securities' app(s); alert if a listing starts mentioning crypto."""
+    prev = {}
+    if os.path.exists(SEC_FILE):
+        try:
+            with open(SEC_FILE, encoding="utf-8") as f:
+                prev = json.load(f)
+        except (OSError, ValueError):
+            prev = {}
+
+    cur = {}
+    for term in SEC_TERMS:                       # Apple
+        for c in ("vn", "us"):
+            for r in _itunes_search(term, c):
+                name = r.get("trackName", "") or ""
+                dev = r.get("sellerName", "") or ""
+                desc = r.get("description", "") or ""
+                if not (SEC_DEV_RE.search(dev) or SEC_DEV_RE.search(name)):
+                    continue
+                appid = "ios:" + str(r.get("bundleId") or r.get("trackId"))
+                cur[appid] = {
+                    "store": "iOS", "name": name, "developer": dev,
+                    "url": r.get("trackViewUrl", "") or "",
+                    "genre": r.get("primaryGenreName", "") or "",
+                    "crypto": bool(SEC_CRYPTO_RE.search(name + " " + desc)),
+                }
+            time.sleep(0.5)
+
+    pkgs = {}                                    # Google Play
+    for term in SEC_TERMS:
+        for gl, hl in (("VN", "vi"), ("US", "en")):
+            for p in _play_search_pkgs(term, gl, hl):
+                pkgs.setdefault(p, term)
+            time.sleep(1.0)
+    budget = 15
+    for pkg in pkgs:
+        if budget <= 0:
+            break
+        name, dev, desc, url = _play_detail(pkg)
+        budget -= 1
+        time.sleep(0.7)
+        if not SEC_DEV_RE.search(f"{pkg} {name} {dev} {desc}"):
+            continue
+        cur["play:" + pkg] = {
+            "store": "Play", "name": name or pkg, "developer": dev, "url": url,
+            "genre": "", "crypto": bool(SEC_CRYPTO_RE.search(name + " " + desc)),
+        }
+
+    # Diff vs previous: new apps and crypto-signal flips are the alerts.
+    now = now_iso()
+    alerts = []
+    for appid, rec in cur.items():
+        old = prev.get(appid)
+        rec["first_seen"] = (old or {}).get("first_seen", now)
+        rec["last_checked"] = now
+        if not old:
+            tag = " [CRYPTO!]" if rec["crypto"] else ""
+            alerts.append(f"VIX Securities app found: {rec['name']} ({rec['store']}){tag}")
+        elif rec["crypto"] and not old.get("crypto"):
+            alerts.append(f"VIX Securities app '{rec['name']}' NOW mentions crypto")
+    with open(SEC_FILE, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+    if alerts:
+        append_changelog("VIX Securities watch", alerts)
+    msg = (f"{now_iso()} securities: {len(cur)} app(s), "
+           f"crypto={sum(1 for r in cur.values() if r['crypto'])}, +{len(alerts)} alert(s)")
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+    print(msg)
+    return alerts
+
+
 # ---------------------------------------------------------------- dashboard
 # Rendering lives in separate modules (redesigned): dashboard.py builds
 # docs/index.html, chart.py builds docs/history.html. Imported lazily so a
@@ -871,6 +977,7 @@ def main():
     reset_pending(pages)
     news_new = fetch_news()
     apps_new = fetch_apps()
+    sec_alerts = fetch_securities()
     li_changes = run_linkedin()
     record_history(pages, links, sitemap["present"])
     build_dashboard()
@@ -882,6 +989,7 @@ def main():
         f"(+{len(d['new_pages'])}p/{len(d['content_changed'])}c/"
         f"{len(d['new_links'])}l) queued {len(pages)} for archive, "
         f"+{len(news_new)} news, +{len(apps_new)} apps, "
+        f"+{len(sec_alerts)} sec-alerts, "
         f"linkedin{'(' + '; '.join(li_changes) + ')' if li_changes else '=ok'}"
     )
     with open(RUN_LOG, "a", encoding="utf-8") as f:
@@ -893,9 +1001,10 @@ if __name__ == "__main__":
     ensure_dirs()
     if "--archive" in sys.argv:
         archive_step()
-    elif "--news" in sys.argv:        # periodic: news + apps + linkedin + republish
+    elif "--news" in sys.argv:        # periodic: news + apps + securities + linkedin
         fetch_news()
         fetch_apps()
+        fetch_securities()
         run_linkedin()
         build_dashboard()
     elif "--apps" in sys.argv:

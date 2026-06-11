@@ -22,7 +22,7 @@ OUTPUT = os.path.join(DOCS_DIR, "index.html")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # +url -> newest capture
 WB_HISTORY = "https://web.archive.org/web/*/"               # +url -> capture calendar
 
-NEWS_LIMIT = 15
+NEWS_LIMIT = 5
 APPS_LIMIT = 25
 CHANGELOG_LIMIT = 5
 RECENT_DAYS = 3        # status banner window
@@ -375,6 +375,28 @@ def render_linkedin(li, now):
                _e(rel_time(li.get("fetched_at", ""), now)), post_html))
 
 
+def render_securities(sec, now):
+    """VIX Securities app watch — incumbent broker; alert if it adds crypto."""
+    if not isinstance(sec, dict) or not sec:
+        return ('<section class="card"><h2>VIX Securities &mdash; crypto watch</h2>'
+                '<p class="muted">No VIX Securities app detected yet.</p></section>')
+    rows = []
+    for rec in sorted(sec.values(), key=lambda r: not r.get("crypto")):
+        store = rec.get("store", "")
+        sb = '<span class="badge %s">%s</span>' % (
+            "ios" if store.lower() == "ios" else "play", _e(store or "?"))
+        name = '<span class="an"><a href="%s" target="_blank" rel="noopener">%s</a></span>' % (
+            _e(rec.get("url") or "#"), _e(rec.get("name") or "(unnamed)"))
+        dev = '<span class="am">%s</span>' % _e(rec.get("developer")) if rec.get("developer") else ""
+        flag = ('<span class="badge new">CRYPTO MENTIONED</span>' if rec.get("crypto")
+                else '<span class="badge en">no crypto yet</span>')
+        rows.append('<li>%s%s%s%s</li>' % (sb, name, dev, flag))
+    return ('<section class="card"><h2>VIX Securities &mdash; crypto watch</h2>'
+            '<p class="cardnote">Incumbent broker (separate from Vixex). '
+            'Flags if their app listing starts mentioning crypto.</p>'
+            '<ul class="apps">%s</ul></section>' % "".join(rows))
+
+
 _URL_RE = re.compile(r"https?://\S+")
 
 
@@ -524,6 +546,9 @@ def build_dashboard():
     linkedin = _read_json(os.path.join(DATA_DIR, "linkedin.json"), {})
     if not isinstance(linkedin, dict):
         linkedin = {}
+    securities = _read_json(os.path.join(DATA_DIR, "securities.json"), {})
+    if not isinstance(securities, dict):
+        securities = {}
     changelog = parse_changelog(_read_text(os.path.join(DATA_DIR, "changelog.md")))
 
     # Sort news newest-first defensively (file is pre-sorted; keep stable).
@@ -568,6 +593,7 @@ def build_dashboard():
     parts.append(render_news(news, now))
     parts.append(render_linkedin(linkedin, now))
     parts.append(render_apps(apps, now))
+    parts.append(render_securities(securities, now))
     parts.append(render_changelog(changelog))
     parts.append(render_pages(state, wayback))
     parts.append(render_links(state))
