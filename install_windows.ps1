@@ -41,9 +41,20 @@ $arcSettings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName "VixxWatchArchive" -Action $arcAction -Trigger $arcTrigger `
     -Settings $arcSettings -Description "vixx.vn Wayback archiver (1 page / 2h, spaced)" -Force | Out-Null
 
+# --- Task 3: news/mentions scan every 6 hours (+ publish) ---
+$newsAction = New-ScheduledTaskAction -Execute $psExe `
+    -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$Wrapper`" -News" -WorkingDirectory $Dir
+$newsTrigger = New-ScheduledTaskTrigger -Once -At 8:45am -RepetitionInterval (New-TimeSpan -Hours 6)
+$newsSettings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable -DontStopOnIdleEnd `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+Register-ScheduledTask -TaskName "VixxWatchNews" -Action $newsAction -Trigger $newsTrigger `
+    -Settings $newsSettings -Description "Vixex/FPT/GELEX news + social mention scan (every 6h)" -Force | Out-Null
+
 Write-Host "`nRegistered tasks:"
 Write-Host "  VixxWatch        - daily 09:00 local (crawl + diff; catches up if PC was off)"
 Write-Host "  VixxWatchArchive - every 2h from 09:30 (archives 1 page/run, spread over the day)"
+Write-Host "  VixxWatchNews    - every 6h from 08:45 (news + mentions scan)"
 Write-Host "Manage:  Get-ScheduledTask VixxWatch*, Get-ScheduledTaskInfo VixxWatch"
-Write-Host "Run now: Start-ScheduledTask VixxWatch ; Start-ScheduledTask VixxWatchArchive"
-Write-Host "Remove:  Unregister-ScheduledTask VixxWatch,VixxWatchArchive -Confirm:`$false"
+Write-Host "Run now: Start-ScheduledTask VixxWatch ; Start-ScheduledTask VixxWatchNews"
+Write-Host "Remove:  Unregister-ScheduledTask VixxWatch,VixxWatchArchive,VixxWatchNews -Confirm:`$false"

@@ -32,6 +32,24 @@ crontab -l               # verify
 ```
 Requires only `python3` (standard library — no pip).
 
+## News & mentions scanner
+Scans for coverage of **Vixex** and its backers **FPT Corporation, FPT IS,
+GELEX Group** across Vietnamese + English news (Google News RSS), Reddit, and
+named VN crypto outlets. New articles are deduped, logged, and shown on the
+dashboard newest-first with source + language.
+
+- Config at the top of `vixx_watch.py`: `NEWS_QUERIES`, `VN_CRYPTO_SITES`,
+  `NEWS_LANGS`. Big corporates (FPT/GELEX) are **scoped to a crypto/exchange
+  context** so their general business news doesn't flood the feed — to track
+  ALL of an entity's news, remove the `_CTX` part of its query.
+- Noise guard: drops VIX-index / VIX-Securities (Chứng khoán VIX) unless the
+  item also mentions crypto/Vixex.
+- Runs every 6h (`VixxWatchNews` task) + once in the daily crawl. Run manually:
+  `python vixx_watch.py --news`.
+- Data: `data/news.jsonl` (all-time), `data/news_seen.json` (dedup),
+  `data/news_latest.json` (feed). **Note:** social platforms beyond Reddit
+  (X/Twitter, Facebook, TikTok) need paid APIs / handles and are not scraped.
+
 ## Web dashboard (GitHub Pages)
 Public URL: **https://berny-the-blade.github.io/vixx-watch/** — share with anyone.
 

@@ -2,7 +2,7 @@
 # pushes it to GitHub Pages. Called by the scheduled tasks.
 #   .\run_and_publish.ps1            # daily crawl + diff
 #   .\run_and_publish.ps1 -Archive   # spaced Wayback archive step
-param([switch]$Archive)
+param([switch]$Archive, [switch]$News)
 $ErrorActionPreference = "Continue"
 
 $Dir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -12,7 +12,9 @@ if (-not $Py -or $Py -like "*WindowsApps*") {
 }
 Set-Location $Dir
 
-if ($Archive) { & $Py "$Dir\vixx_watch.py" --archive } else { & $Py "$Dir\vixx_watch.py" }
+if     ($Archive) { & $Py "$Dir\vixx_watch.py" --archive }
+elseif ($News)    { & $Py "$Dir\vixx_watch.py" --news }
+else              { & $Py "$Dir\vixx_watch.py" }
 
 # Publish the dashboard only if it actually changed.
 git -C $Dir add docs 2>$null

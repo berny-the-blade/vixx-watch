@@ -25,8 +25,10 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 # ---------------------------------------------------------------- config
 SITE = "https://vixx.vn"
@@ -38,12 +40,39 @@ FETCH_TIMEOUT = 30
 WAYBACK_TIMEOUT = 180      # Save-Page-Now blocks until capture completes
 WAYBACK_DELAY = 6.0        # seconds between Save-Page-Now calls (rate limit)
 ARCHIVE_BATCH = 1          # pages archived per --archive run (spaced by scheduler)
+
+# ---- news / mentions monitoring ----
+NEWS_KEEP = 80             # articles kept in the dashboard feed
+# Vietnamese crypto outlets spotlighted via site:-scoped queries (edit freely).
+VN_CRYPTO_SITES = ["coin68.com", "tapchibitcoin.io", "coinnews.vn", "blogtienso.net"]
+# Crypto/exchange context used to scope the big corporates so their general
+# news doesn't flood the feed. To track ALL of an entity's news, drop the ctx.
+_CTX = ('(Vixex OR crypto OR "tài sản mã hóa" OR "tài sản số" OR '
+        '"sàn giao dịch tài sản" OR "tiền số" OR blockchain OR "tài sản số")')
+NEWS_QUERIES = [
+    {"label": "Vixex", "q": '"Vixex" OR "vixx.vn" OR "VIX Crypto Assets Exchange"'},
+    {"label": "FPT×crypto", "q": '"FPT" ' + _CTX + ' (Vixex OR "VIX Crypto" OR "sàn giao dịch tài sản mã hóa")'},
+    {"label": "FPT IS×crypto", "q": '("FPT IS" OR "FPT Information System") ' + _CTX},
+    {"label": "GELEX×crypto", "q": '"GELEX" ' + _CTX},
+]
+NEWS_LANGS = [
+    {"code": "vi", "params": "hl=vi&gl=VN&ceid=VN:vi"},
+    {"code": "en", "params": "hl=en-US&gl=US&ceid=US:en"},
+]
+# Drop obvious VIX-index / VIX-Securities noise unless crypto/Vixex is present.
+NEWS_EXCLUDE = re.compile(
+    r"(VN-?Index|chỉ số VIX|VIX Securities|Chứng khoán VIX|volatility index)", re.I)
+NEWS_KEEP_IF = re.compile(
+    r"(vixex|vixx\.vn|crypto|mã hóa|tài sản số|blockchain|tiền số)", re.I)
 USER_AGENT = "vixx-watch/1.0 (+site change monitor)"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 PENDING_FILE = os.path.join(DATA_DIR, "wayback_pending.json")
+NEWS_SEEN = os.path.join(DATA_DIR, "news_seen.json")
+NEWS_LOG = os.path.join(DATA_DIR, "news.jsonl")
+NEWS_LATEST = os.path.join(DATA_DIR, "news_latest.json")
 DOCS_DIR = os.path.join(BASE_DIR, "docs")          # GitHub Pages source
 DASHBOARD = os.path.join(DOCS_DIR, "index.html")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # redirects to newest capture
@@ -402,6 +431,130 @@ def archive_step(batch=ARCHIVE_BATCH):
     return msg
 
 
+# ---------------------------------------------------------------- news
+def parse_feed(xml_text, lang, label, source_hint):
+    """Parse a Google News (RSS2) or Reddit (Atom) feed into article dicts."""
+    items = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+    for it in root.iter("item"):  # RSS 2.0 (Google News)
+        title = (it.findtext("title") or "").strip()
+        if not title:
+            continue
+        link = (it.findtext("link") or "").strip()
+        guid = (it.findtext("guid") or "").strip()
+        s = it.find("source")
+        src = (s.text or "").strip() if s is not None and s.text else source_hint
+        items.append({
+            "title": title, "link": link, "id": (guid or link).strip(),
+            "published": (it.findtext("pubDate") or "").strip(),
+            "source": src, "lang": lang, "query": label,
+        })
+    ns = "{http://www.w3.org/2005/Atom}"
+    for e in root.iter(ns + "entry"):  # Atom (Reddit)
+        title = (e.findtext(ns + "title") or "").strip()
+        if not title:
+            continue
+        le = e.find(ns + "link")
+        link = le.get("href") if le is not None else ""
+        gid = (e.findtext(ns + "id") or "").strip()
+        items.append({
+            "title": title, "link": link, "id": (gid or link).strip(),
+            "published": (e.findtext(ns + "updated") or "").strip(),
+            "source": source_hint, "lang": lang, "query": label,
+        })
+    return items
+
+
+def _pub_ts(item):
+    p = item.get("published", "")
+    try:
+        return parsedate_to_datetime(p).timestamp()
+    except Exception:  # noqa: BLE001
+        try:
+            return datetime.fromisoformat(p.replace("Z", "+00:00")).timestamp()
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+
+def _gnews_url(query, params):
+    return ("https://news.google.com/rss/search?q="
+            + urllib.parse.quote(query) + "&" + params)
+
+
+def fetch_news():
+    """Query news/forum feeds for Vixex + backers; record new mentions."""
+    seen = {}
+    if os.path.exists(NEWS_SEEN):
+        try:
+            with open(NEWS_SEEN, encoding="utf-8") as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = {}
+
+    collected = []
+    for q in NEWS_QUERIES:                      # Google News, VN + EN
+        for lang in NEWS_LANGS:
+            _, status, text = fetch(_gnews_url(q["q"], lang["params"]), verify=True)
+            if status == 200 and not text.startswith("__ERROR__"):
+                collected += parse_feed(text, lang["code"], q["label"], "Google News")
+            time.sleep(1.0)
+    for site in VN_CRYPTO_SITES:                # site-scoped VN crypto outlets
+        q = f'"Vixex" OR "VIX Crypto Assets Exchange" site:{site}'
+        _, status, text = fetch(_gnews_url(q, "hl=vi&gl=VN&ceid=VN:vi"), verify=True)
+        if status == 200 and not text.startswith("__ERROR__"):
+            collected += parse_feed(text, "vi", f"site:{site}", site)
+        time.sleep(1.0)
+    for term in ['"Vixex"', "vixx.vn"]:         # Reddit / forums
+        url = "https://www.reddit.com/search.rss?sort=new&q=" + urllib.parse.quote(term)
+        _, status, text = fetch(url, verify=True)
+        if status == 200 and not text.startswith("__ERROR__"):
+            collected += parse_feed(text, "en", "Reddit", "Reddit")
+        time.sleep(1.0)
+
+    new = []
+    for it in collected:
+        if not it["id"]:
+            continue
+        t = it["title"]
+        if NEWS_EXCLUDE.search(t) and not NEWS_KEEP_IF.search(t):
+            continue  # VIX-index / VIX-Securities noise
+        if it["query"] == "Reddit" and not re.search(r"vix", t, re.I):
+            continue  # Reddit fuzzy-matches obscure terms; require a vix mention
+        if it["id"] in seen:
+            continue
+        seen[it["id"]] = now_iso()
+        it["first_seen"] = seen[it["id"]]
+        new.append(it)
+
+    if new:
+        with open(NEWS_LOG, "a", encoding="utf-8") as f:
+            for it in new:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    with open(NEWS_SEEN, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False)
+
+    latest = []
+    if os.path.exists(NEWS_LOG):
+        with open(NEWS_LOG, encoding="utf-8") as f:
+            for ln in f.read().splitlines()[-400:]:
+                try:
+                    latest.append(json.loads(ln))
+                except ValueError:
+                    pass
+    latest.sort(key=_pub_ts, reverse=True)
+    with open(NEWS_LATEST, "w", encoding="utf-8") as f:
+        json.dump(latest[:NEWS_KEEP], f, ensure_ascii=False, indent=2)
+
+    msg = f"{now_iso()} news: +{len(new)} new (scanned {len(collected)})"
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+    print(msg)
+    return new
+
+
 # ---------------------------------------------------------------- dashboard
 def _changelog_entries(limit=40):
     """Parse changelog.md into [(timestamp, body_lines), ...] newest first."""
@@ -463,6 +616,14 @@ def build_dashboard():
     pending = load_pending()
     wb = pending.get("pages", {}) if pending.get("date") == today() else {}
 
+    news = []
+    if os.path.exists(NEWS_LATEST):
+        try:
+            with open(NEWS_LATEST, encoding="utf-8") as f:
+                news = json.load(f)
+        except (OSError, ValueError):
+            news = []
+
     pages = sorted(state.get("pages", {}))
     links = state.get("links", [])
     sm = state.get("sitemap", {})
@@ -513,6 +674,26 @@ def build_dashboard():
         )
     feed_html = "\n".join(feed) or "<p class='muted'>No changes recorded yet.</p>"
 
+    # news feed
+    news_rows = []
+    for a in news:
+        if a.get("query") == "Reddit" and not re.search(r"vix", a.get("title", ""), re.I):
+            continue
+        when = html.escape((a.get("published") or a.get("first_seen") or "")[:16])
+        meta = " &middot; ".join(
+            x for x in (html.escape(a.get("source", "")),
+                        html.escape(a.get("query", "")), when) if x
+        )
+        news_rows.append(
+            f"<div class='nitem'><span class='b lang'>{html.escape(a.get('lang','?'))}</span> "
+            f"<a href='{html.escape(a.get('link',''))}' target='_blank' rel='noopener'>"
+            f"{html.escape(a.get('title','(no title)'))}</a>"
+            f"<div class='nmeta'>{meta}</div></div>"
+        )
+    news_html = "\n".join(news_rows) or (
+        "<p class='muted'>No mentions captured yet (first news scan pending).</p>"
+    )
+
     sm_txt = "present" if sm.get("present") else "absent"
     doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -542,6 +723,9 @@ th{{color:var(--mut);font-weight:600}}
 .entry .ts{{color:var(--mut);font-size:12px;margin-bottom:4px}}
 .ch-sec{{font-weight:600;margin:8px 0 2px}}.ch-note{{color:var(--mut);font-style:italic}}
 .entry ul{{margin:4px 0 4px 18px;padding:0}}.entry li{{word-break:break-all}}
+.nitem{{padding:8px 0;border-bottom:1px solid #262a33}}.nitem a{{font-weight:500}}
+.nmeta{{color:var(--mut);font-size:12px;margin-top:2px}}
+.b.lang{{background:#2a2f3a;color:var(--ac);text-transform:uppercase}}
 ul.links{{columns:2;font-size:13px;list-style:none;padding:0}}ul.links li{{margin:3px 0;word-break:break-all}}
 .muted{{color:var(--mut)}}footer{{color:var(--mut);font-size:12px;margin-top:24px}}
 @media(max-width:640px){{ul.links{{columns:1}}}}
@@ -553,9 +737,12 @@ ul.links{{columns:2;font-size:13px;list-style:none;padding:0}}ul.links li{{margi
 <div class="stat"><div class="n">{len(pages)}</div><div class="l">pages</div></div>
 <div class="stat"><div class="n">{len(links)}</div><div class="l">links</div></div>
 <div class="stat"><div class="n">{sm_txt}</div><div class="l">sitemap.xml</div></div>
+<div class="stat"><div class="n">{len(news)}</div><div class="l">news/mentions</div></div>
 </div>
 
-<div class="card"><h2>&#9888; Recent changes</h2>{feed_html}</div>
+<div class="card"><h2>&#128240; News &amp; mentions (Vixex, FPT, FPT IS, GELEX)</h2>{news_html}</div>
+
+<div class="card"><h2>&#9888; Recent site changes</h2>{feed_html}</div>
 
 <div class="card"><h2>Pages ({len(pages)})</h2>
 <table><tr><th>Live URL</th><th>Wayback</th><th>Today</th></tr>
@@ -598,6 +785,7 @@ def main():
 
     # Queue today's pages for the spaced-out archiver (does NOT archive here).
     reset_pending(pages)
+    news_new = fetch_news()
     build_dashboard()
 
     summary = (
@@ -605,7 +793,8 @@ def main():
         f"sitemap={'Y' if sitemap['present'] else 'N'} "
         f"changed={'YES' if changed else 'no'} "
         f"(+{len(d['new_pages'])}p/{len(d['content_changed'])}c/"
-        f"{len(d['new_links'])}l) queued {len(pages)} for archive"
+        f"{len(d['new_links'])}l) queued {len(pages)} for archive, "
+        f"+{len(news_new)} news"
     )
     with open(RUN_LOG, "a", encoding="utf-8") as f:
         f.write(summary + "\n")
@@ -616,5 +805,8 @@ if __name__ == "__main__":
     ensure_dirs()
     if "--archive" in sys.argv:
         archive_step()
+    elif "--news" in sys.argv:
+        fetch_news()
+        build_dashboard()
     else:
         main()
