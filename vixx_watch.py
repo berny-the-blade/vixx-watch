@@ -48,12 +48,20 @@ ARCHIVE_BATCH = 1          # pages archived per --archive run (spaced by schedul
 NEWS_KEEP = 80             # articles kept in the dashboard feed
 # Vietnamese crypto outlets — Vixex-scoped site: queries (edit freely).
 VN_CRYPTO_SITES = ["coin68.com", "tapchibitcoin.io", "coinnews.vn", "blogtienso.net"]
-# Mainstream VN outlets — broader crypto-asset/market theme (catches regulation
-# & market-context articles that don't name Vixex). Add/remove freely.
-VN_NEWS_SITES = ["vietnamplus.vn", "baotintuc.vn", "diendandoanhnghiep.vn",
-                 "vnexpress.net", "cafef.vn", "tuoitre.vn", "thanhnien.vn"]
-VN_THEME_Q = ('("tài sản mã hóa" OR "tài sản số" OR "sàn giao dịch tài sản" OR '
-              'Vixex OR "tiền mã hóa" OR "tiền số")')
+# Crypto-exchange / regulation focus — keeps Vixex + licensing/market-structure
+# articles, drops generic bitcoin/altcoin price chatter.
+VN_THEME_Q = (
+    '("sàn giao dịch tài sản mã hóa" OR "sàn tài sản mã hóa" OR '
+    '"sàn giao dịch tài sản số" OR "sàn giao dịch crypto" OR Vixex OR '
+    '"VIX Crypto Assets Exchange" OR ("tài sản mã hóa" AND '
+    '(sàn OR "cấp phép" OR "giấy phép" OR "thí điểm" OR "khung pháp lý" OR '
+    '"Nghị định" OR UBCKNN OR "sàn nội địa" OR "vi phạm" OR "an toàn thị trường")))')
+# Title gate for site-theme articles: must actually be about a crypto exchange /
+# regulation / Vixex — not just any article that mentions crypto in passing.
+NEWS_FOCUS_RE = re.compile(
+    r"(vixex|sàn giao dịch|sàn tài sản|cấp phép|giấy phép|thí điểm|khung pháp lý|"
+    r"nghị định|ubcknn|tài sản mã hóa|tài sản số|sàn nội địa|fpt|gelex|"
+    r"trung tâm tài chính)", re.I)
 # Crypto/exchange context used to scope the big corporates so their general
 # news doesn't flood the feed. To track ALL of an entity's news, drop the ctx.
 _CTX = ('(Vixex OR crypto OR "tài sản mã hóa" OR "tài sản số" OR '
@@ -587,12 +595,13 @@ def fetch_news():
         if status == 200 and not text.startswith("__ERROR__"):
             collected += parse_feed(text, "vi", f"site:{site}", site)
         time.sleep(1.0)
-    for site in VN_NEWS_SITES:                  # broader crypto-market theme
-        q = f"{VN_THEME_Q} site:{site}"
-        _, status, text = fetch(_gnews_url(q, "hl=vi&gl=VN&ceid=VN:vi"), verify=True)
-        if status == 200 and not text.startswith("__ERROR__"):
-            collected += parse_feed(text, "vi", f"site:{site}", site)
-        time.sleep(1.0)
+    # Focused VN crypto-exchange/regulation theme. Google News RSS ignores the
+    # site: operator, so one theme query covers all outlets; the NEWS_FOCUS_RE
+    # title gate below keeps only genuine exchange/regulation/Vixex articles.
+    _, status, text = fetch(_gnews_url(VN_THEME_Q, "hl=vi&gl=VN&ceid=VN:vi"), verify=True)
+    if status == 200 and not text.startswith("__ERROR__"):
+        collected += parse_feed(text, "vi", "vn:exchange", "Google News")
+    time.sleep(1.0)
     for term in ['"Vixex"', "vixx.vn"]:         # Reddit / forums
         url = "https://www.reddit.com/search.rss?sort=new&q=" + urllib.parse.quote(term)
         _, status, text = fetch(url, verify=True)
@@ -609,6 +618,8 @@ def fetch_news():
             continue  # VIX-index / VIX-Securities noise
         if it["query"] == "Reddit" and not re.search(r"vix", t, re.I):
             continue  # Reddit fuzzy-matches obscure terms; require a vix mention
+        if it["query"].startswith("vn:") and not NEWS_FOCUS_RE.search(t):
+            continue  # mainstream-outlet article not actually about a crypto exchange
         if it["id"] in seen:
             continue
         seen[it["id"]] = now_iso()
