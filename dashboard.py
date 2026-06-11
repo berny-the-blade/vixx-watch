@@ -22,7 +22,8 @@ OUTPUT = os.path.join(DOCS_DIR, "index.html")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # +url -> newest capture
 WB_HISTORY = "https://web.archive.org/web/*/"               # +url -> capture calendar
 
-NEWS_LIMIT = 5
+NEWS_LIMIT = 5         # visible at once (client-side toggle picks which 5)
+NEWS_POOL = 80         # items rendered hidden so the narrow toggle has material
 APPS_LIMIT = 25
 CHANGELOG_LIMIT = 5
 RECENT_DAYS = 3        # status banner window
@@ -235,6 +236,8 @@ h1{font-size:22px;margin:0;font-weight:700}
 .card{background:var(--card);border-radius:11px;padding:16px 18px;margin:16px 0;border:1px solid #21252e}
 h2{font-size:15px;margin:0 0 4px;font-weight:700;letter-spacing:.01em}
 .cardnote{color:var(--mut);font-size:12px;margin:0 0 12px}
+.toggle{float:right;font-size:12px;color:var(--mut);font-weight:600;cursor:pointer;user-select:none}
+.toggle input{vertical-align:middle;margin-right:5px;cursor:pointer}
 .news{list-style:none;margin:0;padding:0}
 .news li{padding:11px 0;border-bottom:1px solid #262a33}
 .news li:last-child{border-bottom:0}
@@ -282,16 +285,28 @@ def stat(n, label):
             '<div class="l">%s</div></div>') % (_e(n), _e(label))
 
 
+NARROW_RE = re.compile(r"vixex|\bfpt\b|gelex|vix\s*crypto", re.I)
+
+
+def _news_scope(it):
+    """'narrow' = Vixex / FPT / GELEX specific; 'broad' = general sector news."""
+    q = it.get("query") or ""
+    if q and q != "vn:exchange":          # entity / Vixex-scoped queries
+        return "narrow"
+    return "narrow" if NARROW_RE.search(it.get("title", "")) else "broad"
+
+
 def render_news(news, now):
     total = len(news)
-    items = news[:NEWS_LIMIT]
+    items = news[:NEWS_POOL]              # render a pool; JS shows NEWS_LIMIT of active filter
     rows = []
     for it in items:
+        scope = _news_scope(it)
         title = it.get("title") or "(untitled)"
         link = it.get("link") or "#"
         lang = (it.get("lang") or "").lower()
         title_en = (it.get("title_en") or "").strip()
-        rows.append('<li>')
+        rows.append('<li data-scope="%s">' % scope)
         rows.append('<div class="t"><a href="%s" target="_blank" rel="noopener">%s</a></div>'
                     % (_e(link), _e(title)))
         if title_en and lang != "en" and title_en != title:
@@ -300,20 +315,33 @@ def render_news(news, now):
             "en" if lang == "en" else "vi", "EN" if lang == "en" else "VI")
         when = it.get("published") or it.get("first_seen") or ""
         meta = [langbadge]
+        if scope == "narrow":
+            meta.append('<span class="badge play">Vixex/backer</span>')
+        else:
+            meta.append('<span class="badge en">sector</span>')
         if it.get("source"):
             meta.append('<span>%s</span>' % _e(it.get("source")))
-        if it.get("query"):
-            meta.append('<span>· %s</span>' % _e(it.get("query")))
-        meta.append('<span>· %s</span>' % _e(rel_time(when, now)))
+        meta.append('<span>&middot; %s</span>' % _e(rel_time(when, now)))
         rows.append('<div class="meta">%s</div>' % "".join(meta))
         rows.append('</li>')
     body = "".join(rows) if rows else '<li class="muted">No news items tracked yet.</li>'
-    note = ""
-    if total > NEWS_LIMIT:
-        note = ('<p class="cardnote">Showing %d most recent of %d tracked.</p>'
-                % (len(items), total))
-    return ('<section class="card"><h2>News</h2>%s'
-            '<ul class="news">%s</ul></section>') % (note, body)
+    toggle = ('<label class="toggle"><input type="checkbox" id="narrowonly"> '
+              'Vixex + backers only</label>')
+    note = ('<p class="cardnote">Showing the %d most recent. Tick the box to limit '
+            'to Vixex / FPT / GELEX only.</p>' % NEWS_LIMIT)
+    script = (
+        "<script>(function(){var L=%d,cb=document.getElementById('narrowonly');"
+        "if(!cb)return;function f(){var n=cb.checked,s=0;"
+        "document.querySelectorAll('#newslist>li').forEach(function(li){"
+        "var ok=!n||li.dataset.scope==='narrow';"
+        "if(ok&&s<L){li.style.display='';s++;}else{li.style.display='none';}});"
+        "try{localStorage.setItem('vixx_narrow',n?'1':'0');}catch(e){}}"
+        "cb.addEventListener('change',f);"
+        "try{if(localStorage.getItem('vixx_narrow')==='1')cb.checked=true;}catch(e){}"
+        "f();})();</script>" % NEWS_LIMIT)
+    return ('<section class="card"><h2>News %s</h2>%s'
+            '<ul class="news" id="newslist">%s</ul>%s</section>'
+            % (toggle, note, body, script))
 
 
 def render_apps(apps, now):
