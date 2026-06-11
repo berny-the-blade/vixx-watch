@@ -31,10 +31,13 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 # ---------------------------------------------------------------- config
-SITE = "https://vixx.vn"
-HOST = "vixx.vn"
-SEEDS = [f"{SITE}/", f"{SITE}/vi", f"{SITE}/en"]
-MAX_PAGES = 100
+# Monitored domains. vixex.vn is not live yet (no DNS) — armed so the monitor
+# catches its pages/links the moment it goes online.
+SITES = ["https://vixx.vn", "https://vixex.vn"]
+HOSTS = {"vixx.vn", "www.vixx.vn", "vixex.vn", "www.vixex.vn"}
+SITE = SITES[0]            # base used by normalize() for relative seeds
+SEEDS = [s + p for s in SITES for p in ("/", "/vi", "/en")]
+MAX_PAGES = 150
 CRAWL_DELAY = 1.0          # seconds between page fetches (polite)
 FETCH_TIMEOUT = 30
 WAYBACK_TIMEOUT = 180      # Save-Page-Now blocks until capture completes
@@ -64,6 +67,35 @@ NEWS_EXCLUDE = re.compile(
     r"(VN-?Index|chỉ số VIX|VIX Securities|Chứng khoán VIX|volatility index)", re.I)
 NEWS_KEEP_IF = re.compile(
     r"(vixex|vixx\.vn|crypto|mã hóa|tài sản số|blockchain|tiền số)", re.I)
+
+# ---- app-store watch (Apple iTunes Search API + Google Play scrape) ----
+APPS_KEEP = 60
+APP_TERMS = ["Vixex", "VIX exchange", "VIX crypto", "VIX trading", "VIX wallet"]
+PLAY_DETAIL_CAP = 25       # max Google Play app-detail fetches per run (bounds cost)
+# Precision filters: exact brand "vixex" anywhere is always kept; a standalone
+# "VIX" token is kept only with a crypto/trading context; securities/index never.
+APP_BRAND_RE = re.compile(r"vixex", re.I)
+APP_VIXTOKEN_RE = re.compile(r"\bvix\b", re.I)
+APP_CONTEXT_RE = re.compile(
+    r"(crypto|exchange|trading|wallet|coin|blockchain|defi|web3|"
+    r"tài sản|tiền số|sàn|giao dịch)", re.I)
+APP_EXCLUDE_RE = re.compile(
+    r"(securit|chứng khoán|fear\s*&?\s*greed|volatilit|vn-?index|\bindex\b)", re.I)
+
+
+def _app_relevant(name, genre="", extra=""):
+    """True only for a VIXEX-brand app or a VIX-token crypto/trading app."""
+    blob = f"{name} {genre} {extra}"
+    if APP_EXCLUDE_RE.search(blob):
+        return False                       # VIX Securities / VIX index, etc.
+    if APP_BRAND_RE.search(blob):
+        return True                        # exact "vixex" brand (name or package)
+    if APP_VIXTOKEN_RE.search(name) and (
+        (genre or "").lower() in ("finance", "business")
+        or APP_CONTEXT_RE.search(blob)):
+        return True
+    return False
+
 USER_AGENT = "vixx-watch/1.0 (+site change monitor)"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +105,11 @@ PENDING_FILE = os.path.join(DATA_DIR, "wayback_pending.json")
 NEWS_SEEN = os.path.join(DATA_DIR, "news_seen.json")
 NEWS_LOG = os.path.join(DATA_DIR, "news.jsonl")
 NEWS_LATEST = os.path.join(DATA_DIR, "news_latest.json")
+NEWS_TR = os.path.join(DATA_DIR, "news_tr.json")   # id -> English title cache
+TRANSLATE_PER_RUN = 60     # cap VN->EN translations per run (backfills over time)
+APPS_SEEN = os.path.join(DATA_DIR, "apps_seen.json")
+APPS_LOG = os.path.join(DATA_DIR, "apps.jsonl")
+APPS_LATEST = os.path.join(DATA_DIR, "apps_latest.json")
 DOCS_DIR = os.path.join(BASE_DIR, "docs")          # GitHub Pages source
 DASHBOARD = os.path.join(DOCS_DIR, "index.html")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # redirects to newest capture
@@ -159,14 +196,16 @@ def normalize(url, base):
         return None
     url = urllib.parse.urljoin(base, url)
     url, _frag = urllib.parse.urldefrag(url)
-    if url.endswith("/") and url.rstrip("/") != f"{SITE}":
-        url = url.rstrip("/")
+    if url.endswith("/"):
+        p = urllib.parse.urlparse(url)
+        if p.path not in ("", "/"):       # keep bare host roots, trim others
+            url = url.rstrip("/")
     return url or None
 
 
 def is_internal(url):
     try:
-        return urllib.parse.urlparse(url).netloc in (HOST, f"www.{HOST}")
+        return urllib.parse.urlparse(url).netloc in HOSTS
     except ValueError:
         return False
 
@@ -212,9 +251,8 @@ def crawl():
         final = normalize(final, SITE) or norm
         if final in pages:
             continue
-        if text.startswith("__ERROR__") or status == 0:
-            pages[final] = {"hash": "", "status": 0, "len": 0, "note": text[:200]}
-            continue
+        if status != 200 or text.startswith("__ERROR__"):
+            continue  # unreachable/404 (e.g. vixex.vn not live yet) -> not a live page
 
         decoded = decode_payload(text)
         # save raw snapshot
@@ -252,13 +290,22 @@ def crawl():
 
 
 def check_sitemap():
-    final, status, text = fetch(f"{SITE}/sitemap.xml")
-    # Next.js serves a 200-looking SPA error page for unknown routes; treat
-    # only real XML as a present sitemap.
-    present = status == 200 and "<urlset" in text.lower()
-    h = sha(clean_for_hash(text)) if present else ""
-    urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text) if present else []
-    return {"present": present, "status": status, "hash": h, "urls": sorted(set(urls))}
+    """Check sitemap.xml on every monitored domain; combine into one record."""
+    per, all_urls, hashes, any_present = {}, [], [], False
+    for site in SITES:
+        _, status, text = fetch(f"{site}/sitemap.xml")
+        # Next.js serves a 200-looking SPA error page for unknown routes; treat
+        # only real XML as a present sitemap.
+        present = status == 200 and "<urlset" in text.lower()
+        urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text) if present else []
+        per[site] = {"present": present, "status": status,
+                     "hash": sha(clean_for_hash(text)) if present else "",
+                     "urls": sorted(set(urls))}
+        any_present = any_present or present
+        all_urls += urls
+        hashes.append(site + ":" + per[site]["hash"])
+    return {"present": any_present, "status": 0, "hash": sha("|".join(hashes)),
+            "urls": sorted(set(all_urls)), "per_site": per}
 
 
 # ---------------------------------------------------------------- diff
@@ -484,6 +531,23 @@ def _gnews_url(query, params):
             + urllib.parse.quote(query) + "&" + params)
 
 
+def translate_vi_en(text):
+    """Best-effort VN->EN via Google's public translate endpoint. '' on failure."""
+    if not text.strip():
+        return ""
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
+           "&sl=vi&tl=en&dt=t&q=" + urllib.parse.quote(text))
+    _, status, body = fetch(url, verify=True, timeout=15)
+    if status != 200 or body.startswith("__ERROR__"):
+        return ""
+    try:
+        data = json.loads(body)
+        out = "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+        return out if out.lower() != text.strip().lower() else ""
+    except (ValueError, IndexError, TypeError):
+        return ""
+
+
 def fetch_news():
     """Query news/forum feeds for Vixex + backers; record new mentions."""
     seen = {}
@@ -545,8 +609,33 @@ def fetch_news():
                 except ValueError:
                     pass
     latest.sort(key=_pub_ts, reverse=True)
+    latest = latest[:NEWS_KEEP]
+
+    # Attach English titles to Vietnamese items (cached; backfills over runs).
+    cache = {}
+    if os.path.exists(NEWS_TR):
+        try:
+            with open(NEWS_TR, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    budget = TRANSLATE_PER_RUN
+    for a in latest:
+        if a.get("lang") != "vi" or not a.get("title"):
+            continue
+        tid = a.get("id") or a.get("link") or a["title"]
+        if tid in cache:
+            a["title_en"] = cache[tid]
+        elif budget > 0:
+            en = translate_vi_en(a["title"])
+            cache[tid] = en
+            a["title_en"] = en
+            budget -= 1
+            time.sleep(0.3)
+    with open(NEWS_TR, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
     with open(NEWS_LATEST, "w", encoding="utf-8") as f:
-        json.dump(latest[:NEWS_KEEP], f, ensure_ascii=False, indent=2)
+        json.dump(latest, f, ensure_ascii=False, indent=2)
 
     msg = f"{now_iso()} news: +{len(new)} new (scanned {len(collected)})"
     with open(RUN_LOG, "a", encoding="utf-8") as f:
@@ -555,207 +644,202 @@ def fetch_news():
     return new
 
 
+# ---------------------------------------------------------------- app stores
+def _apple_search(term, country):
+    url = "https://itunes.apple.com/search?" + urllib.parse.urlencode(
+        {"term": term, "country": country, "entity": "software", "limit": 25})
+    _, status, text = fetch(url, verify=True)
+    out = []
+    if status == 200 and not text.startswith("__ERROR__"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return out
+        for r in data.get("results", []):
+            name = r.get("trackName", "") or ""
+            desc = r.get("description", "") or ""
+            if not _app_relevant(name, r.get("primaryGenreName", "") or "", desc[:400]):
+                continue
+            out.append({
+                "store": "iOS", "id": "ios:" + str(r.get("bundleId") or r.get("trackId")),
+                "name": name, "developer": r.get("sellerName", "") or "",
+                "genre": r.get("primaryGenreName", "") or "",
+                "url": r.get("trackViewUrl", "") or "",
+                "updated": (r.get("currentVersionReleaseDate") or "")[:10],
+                "country": country, "term": term,
+            })
+    return out
+
+
+def _play_search_pkgs(term, gl, hl):
+    url = "https://play.google.com/store/search?" + urllib.parse.urlencode(
+        {"q": term, "c": "apps", "gl": gl, "hl": hl})
+    _, status, text = fetch(url, verify=True)
+    pkgs, seen = [], set()
+    if status == 200 and not text.startswith("__ERROR__"):
+        for m in re.finditer(r"/store/apps/details\?id=([A-Za-z0-9_.]+)", text):
+            p = m.group(1)
+            if p not in seen:
+                seen.add(p)
+                pkgs.append(p)
+    return pkgs[:10]
+
+
+def _play_detail(pkg):
+    url = "https://play.google.com/store/apps/details?" + urllib.parse.urlencode(
+        {"id": pkg, "hl": "en"})
+    _, status, text = fetch(url, verify=True)
+    name, dev, desc = "", "", ""
+    if status == 200 and not text.startswith("__ERROR__"):
+        m = re.search(r'<meta property="og:title" content="([^"]+)"', text)
+        if m:
+            name = html.unescape(m.group(1)).replace(" - Apps on Google Play", "").strip()
+        m = re.search(r'<meta property="og:description" content="([^"]+)"', text)
+        if m:
+            desc = html.unescape(m.group(1)).strip()
+        m = re.search(r'href="/store/apps/dev(?:eloper)?\?id=[^"]*"[^>]*>([^<]+)<', text)
+        if m:
+            dev = html.unescape(m.group(1)).strip()
+    return name, dev, desc, url
+
+
+def fetch_apps():
+    """Scan Apple App Store + Google Play for VIX-named crypto/trading apps."""
+    seen = {}
+    if os.path.exists(APPS_SEEN):
+        try:
+            with open(APPS_SEEN, encoding="utf-8") as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = {}
+
+    found = []
+    for term in APP_TERMS:                      # Apple iTunes Search API (official)
+        for c in ("us", "vn"):
+            found += _apple_search(term, c)
+            time.sleep(0.5)
+
+    pkgs = {}                                   # Google Play (scrape search)
+    for term in APP_TERMS:
+        for gl, hl in (("US", "en"), ("VN", "vi")):
+            for p in _play_search_pkgs(term, gl, hl):
+                pkgs.setdefault(p, term)
+            time.sleep(1.0)
+    budget = PLAY_DETAIL_CAP
+    for pkg, term in pkgs.items():
+        appid = "play:" + pkg
+        if appid in seen:
+            continue
+        playurl = "https://play.google.com/store/apps/details?id=" + pkg
+        name, dev, desc, url = pkg, "", "", playurl
+        if budget > 0:
+            name, dev, desc, url = _play_detail(pkg)
+            name = name or pkg
+            budget -= 1
+            time.sleep(0.7)
+        if not _app_relevant(name, "", f"{pkg} {desc}"):
+            continue
+        found.append({
+            "store": "Play", "id": appid, "name": name, "developer": dev,
+            "genre": "", "url": url, "updated": "", "country": "", "term": term,
+        })
+
+    new = []
+    for a in found:
+        if a["id"] in seen:
+            continue
+        seen[a["id"]] = now_iso()
+        a["first_seen"] = seen[a["id"]]
+        new.append(a)
+
+    if new:
+        with open(APPS_LOG, "a", encoding="utf-8") as f:
+            for a in new:
+                f.write(json.dumps(a, ensure_ascii=False) + "\n")
+    with open(APPS_SEEN, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False)
+
+    latest = []
+    if os.path.exists(APPS_LOG):
+        with open(APPS_LOG, encoding="utf-8") as f:
+            for ln in f.read().splitlines()[-300:]:
+                try:
+                    latest.append(json.loads(ln))
+                except ValueError:
+                    pass
+    latest.sort(key=lambda a: a.get("first_seen", ""), reverse=True)
+    with open(APPS_LATEST, "w", encoding="utf-8") as f:
+        json.dump(latest[:APPS_KEEP], f, ensure_ascii=False, indent=2)
+
+    msg = f"{now_iso()} apps: +{len(new)} new (scanned {len(found)})"
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+    print(msg)
+    return new
+
+
 # ---------------------------------------------------------------- dashboard
-def _changelog_entries(limit=40):
-    """Parse changelog.md into [(timestamp, body_lines), ...] newest first."""
-    if not os.path.exists(CHANGELOG):
-        return []
-    with open(CHANGELOG, encoding="utf-8") as f:
-        text = f.read()
-    entries = []
-    for block in text.split("\n## ")[1:]:
-        lines = block.strip("\n").split("\n")
-        ts = lines[0].strip()
-        entries.append((ts, lines[1:]))
-    entries.reverse()
-    return entries[:limit]
-
-
-def _render_change_body(lines):
-    out, in_list = [], False
-    for ln in lines:
-        ln = ln.rstrip()
-        if not ln:
-            continue
-        if ln.startswith("### "):
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            out.append(f'<div class="ch-sec">{html.escape(ln[4:])}</div>')
-        elif ln.startswith("- "):
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
-            item = ln[2:].strip()
-            if item.startswith("http"):
-                out.append(
-                    f'<li><a href="{html.escape(item)}" target="_blank" '
-                    f'rel="noopener">{html.escape(item)}</a></li>'
-                )
-            else:
-                out.append(f"<li>{html.escape(item)}</li>")
-        elif ln.startswith("_") and ln.endswith("_"):
-            out.append(f'<div class="ch-note">{html.escape(ln.strip("_"))}</div>')
-        else:
-            out.append(f"<div>{html.escape(ln)}</div>")
-    if in_list:
-        out.append("</ul>")
-    return "\n".join(out)
-
-
+# Rendering lives in separate modules (redesigned): dashboard.py builds
+# docs/index.html, chart.py builds docs/history.html. Imported lazily so a
+# render-module error never blocks data collection.
 def build_dashboard():
-    """Render docs/index.html from current state — self-contained, colleague-shareable."""
-    os.makedirs(DOCS_DIR, exist_ok=True)
-    state = {}
-    if os.path.exists(STATE_FILE):
+    """Regenerate the dashboard + history pages from current data."""
+    try:
+        import dashboard
+        dashboard.build_dashboard()
+    except Exception as e:  # noqa: BLE001
+        print(f"{now_iso()} dashboard render failed: {e}")
+    try:
+        import chart
+        chart.build_chart()
+    except Exception as e:  # noqa: BLE001
+        print(f"{now_iso()} chart render failed: {e}")
+
+
+# ---------------------------------------------------------------- history / linkedin
+HISTORY = os.path.join(DATA_DIR, "history.jsonl")
+
+
+def _count_json_list(path):
+    if os.path.exists(path):
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                state = json.load(f)
+            with open(path, encoding="utf-8") as f:
+                return len(json.load(f))
         except (OSError, ValueError):
-            state = {}
-    pending = load_pending()
-    wb = pending.get("pages", {}) if pending.get("date") == today() else {}
+            return 0
+    return 0
 
-    news = []
-    if os.path.exists(NEWS_LATEST):
-        try:
-            with open(NEWS_LATEST, encoding="utf-8") as f:
-                news = json.load(f)
-        except (OSError, ValueError):
-            news = []
 
-    pages = sorted(state.get("pages", {}))
-    links = state.get("links", [])
-    sm = state.get("sitemap", {})
-    updated = state.get("crawled_at", "—")
+def record_history(pages, links, sitemap_present):
+    """Append today's metrics to history.jsonl (one record per date, latest wins)."""
+    rec = {"date": today(), "pages": len(pages), "links": len(links),
+           "news_total": _count_json_list(NEWS_LATEST),
+           "apps_total": _count_json_list(APPS_LATEST),
+           "sitemap": bool(sitemap_present), "ts": now_iso()}
+    records = {}
+    if os.path.exists(HISTORY):
+        with open(HISTORY, encoding="utf-8") as f:
+            for ln in f.read().splitlines():
+                try:
+                    r = json.loads(ln)
+                    records[r["date"]] = r
+                except (ValueError, KeyError):
+                    pass
+    records[rec["date"]] = rec
+    with open(HISTORY, "w", encoding="utf-8") as f:
+        for dkey in sorted(records):
+            f.write(json.dumps(records[dkey], ensure_ascii=False) + "\n")
+    return rec
 
-    entries = _changelog_entries()
-    # Has a real (non-baseline) change happened recently?
-    recent_change = ""
-    for ts, body in entries:
-        if not any("Baseline established" in l for l in body):
-            recent_change = ts
-            break
-    if recent_change:
-        banner = (
-            f'<div class="banner alert">&#9888; Changes detected &mdash; '
-            f'most recent: <b>{html.escape(recent_change)}</b>. See the feed below.</div>'
-        )
-    else:
-        banner = '<div class="banner ok">&#10003; No structural changes recorded yet.</div>'
 
-    # pages table
-    rows = []
-    for u in pages:
-        info = wb.get(u, {})
-        st = info.get("status", "—")
-        arch = info.get("archived", "")
-        snap = arch if (st == "OK" and arch) else WB_LATEST + u
-        badge = "ok" if st == "OK" else ("pend" if st in ("—", "pending") else "warn")
-        rows.append(
-            f"<tr><td><a href='{html.escape(u)}' target='_blank' rel='noopener'>"
-            f"{html.escape(u)}</a></td>"
-            f"<td><a href='{html.escape(snap)}' target='_blank' rel='noopener'>snapshot</a> "
-            f"&middot; <a href='{html.escape(WB_HISTORY + u)}' target='_blank' "
-            f"rel='noopener'>history</a></td>"
-            f"<td><span class='b {badge}'>{html.escape(str(st))}</span></td></tr>"
-        )
-
-    link_items = "\n".join(
-        f"<li><a href='{html.escape(l)}' target='_blank' rel='noopener'>{html.escape(l)}</a></li>"
-        for l in links
-    )
-
-    feed = []
-    for ts, body in entries:
-        feed.append(
-            f'<div class="entry"><div class="ts">{html.escape(ts)}</div>'
-            f"{_render_change_body(body)}</div>"
-        )
-    feed_html = "\n".join(feed) or "<p class='muted'>No changes recorded yet.</p>"
-
-    # news feed
-    news_rows = []
-    for a in news:
-        if a.get("query") == "Reddit" and not re.search(r"vix", a.get("title", ""), re.I):
-            continue
-        when = html.escape((a.get("published") or a.get("first_seen") or "")[:16])
-        meta = " &middot; ".join(
-            x for x in (html.escape(a.get("source", "")),
-                        html.escape(a.get("query", "")), when) if x
-        )
-        news_rows.append(
-            f"<div class='nitem'><span class='b lang'>{html.escape(a.get('lang','?'))}</span> "
-            f"<a href='{html.escape(a.get('link',''))}' target='_blank' rel='noopener'>"
-            f"{html.escape(a.get('title','(no title)'))}</a>"
-            f"<div class='nmeta'>{meta}</div></div>"
-        )
-    news_html = "\n".join(news_rows) or (
-        "<p class='muted'>No mentions captured yet (first news scan pending).</p>"
-    )
-
-    sm_txt = "present" if sm.get("present") else "absent"
-    doc = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vixx.vn change monitor</title>
-<style>
-:root{{--bg:#0f1115;--card:#1a1d24;--mut:#8b93a7;--fg:#e6e9ef;--ac:#5b9dff;--ok:#2ea043;--warn:#d29922;--alert:#f85149}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,Segoe UI,Arial}}
-a{{color:var(--ac);text-decoration:none}}a:hover{{text-decoration:underline}}
-.wrap{{max-width:1000px;margin:0 auto;padding:24px}}
-h1{{font-size:22px;margin:0 0 4px}}.sub{{color:var(--mut);font-size:13px;margin-bottom:18px}}
-.banner{{padding:12px 16px;border-radius:8px;margin:14px 0;font-weight:600}}
-.banner.alert{{background:rgba(248,81,73,.15);border:1px solid var(--alert);color:#ffb4ae}}
-.banner.ok{{background:rgba(46,160,67,.12);border:1px solid var(--ok);color:#85e89d}}
-.stats{{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 20px}}
-.stat{{background:var(--card);border-radius:8px;padding:10px 14px;min-width:90px}}
-.stat .n{{font-size:20px;font-weight:700}}.stat .l{{color:var(--mut);font-size:12px}}
-.card{{background:var(--card);border-radius:10px;padding:16px 18px;margin:16px 0}}
-h2{{font-size:16px;margin:0 0 12px}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-td,th{{text-align:left;padding:7px 8px;border-bottom:1px solid #262a33;vertical-align:top}}
-th{{color:var(--mut);font-weight:600}}
-.b{{font-size:11px;padding:2px 7px;border-radius:10px}}
-.b.ok{{background:rgba(46,160,67,.2);color:#85e89d}}.b.pend{{background:#2a2f3a;color:var(--mut)}}
-.b.warn{{background:rgba(210,153,34,.2);color:#e3b341}}
-.entry{{border-left:3px solid var(--ac);padding:6px 0 6px 14px;margin:14px 0}}
-.entry .ts{{color:var(--mut);font-size:12px;margin-bottom:4px}}
-.ch-sec{{font-weight:600;margin:8px 0 2px}}.ch-note{{color:var(--mut);font-style:italic}}
-.entry ul{{margin:4px 0 4px 18px;padding:0}}.entry li{{word-break:break-all}}
-.nitem{{padding:8px 0;border-bottom:1px solid #262a33}}.nitem a{{font-weight:500}}
-.nmeta{{color:var(--mut);font-size:12px;margin-top:2px}}
-.b.lang{{background:#2a2f3a;color:var(--ac);text-transform:uppercase}}
-ul.links{{columns:2;font-size:13px;list-style:none;padding:0}}ul.links li{{margin:3px 0;word-break:break-all}}
-.muted{{color:var(--mut)}}footer{{color:var(--mut);font-size:12px;margin-top:24px}}
-@media(max-width:640px){{ul.links{{columns:1}}}}
-</style></head><body><div class="wrap">
-<h1>vixx.vn &mdash; website change monitor</h1>
-<div class="sub">Last crawl: <b>{html.escape(updated)}</b> (UTC) &middot; auto-updates when the monitor runs</div>
-{banner}
-<div class="stats">
-<div class="stat"><div class="n">{len(pages)}</div><div class="l">pages</div></div>
-<div class="stat"><div class="n">{len(links)}</div><div class="l">links</div></div>
-<div class="stat"><div class="n">{sm_txt}</div><div class="l">sitemap.xml</div></div>
-<div class="stat"><div class="n">{len(news)}</div><div class="l">news/mentions</div></div>
-</div>
-
-<div class="card"><h2>&#128240; News &amp; mentions (Vixex, FPT, FPT IS, GELEX)</h2>{news_html}</div>
-
-<div class="card"><h2>&#9888; Recent site changes</h2>{feed_html}</div>
-
-<div class="card"><h2>Pages ({len(pages)})</h2>
-<table><tr><th>Live URL</th><th>Wayback</th><th>Today</th></tr>
-{''.join(rows)}
-</table></div>
-
-<div class="card"><h2>All tracked links ({len(links)})</h2>
-<ul class="links">{link_items}</ul></div>
-
-<footer>Generated by vixx-watch. Snapshot = latest Wayback capture; history = all captures.</footer>
-</div></body></html>"""
-    with open(DASHBOARD, "w", encoding="utf-8") as f:
-        f.write(doc)
+def run_linkedin():
+    """Call the LinkedIn monitor module defensively; return change strings."""
+    try:
+        import linkedin
+        return linkedin.fetch_linkedin() or []
+    except Exception as e:  # noqa: BLE001
+        print(f"{now_iso()} linkedin fetch failed: {e}")
+        return []
 
 
 # ---------------------------------------------------------------- main
@@ -786,6 +870,9 @@ def main():
     # Queue today's pages for the spaced-out archiver (does NOT archive here).
     reset_pending(pages)
     news_new = fetch_news()
+    apps_new = fetch_apps()
+    li_changes = run_linkedin()
+    record_history(pages, links, sitemap["present"])
     build_dashboard()
 
     summary = (
@@ -794,7 +881,8 @@ def main():
         f"changed={'YES' if changed else 'no'} "
         f"(+{len(d['new_pages'])}p/{len(d['content_changed'])}c/"
         f"{len(d['new_links'])}l) queued {len(pages)} for archive, "
-        f"+{len(news_new)} news"
+        f"+{len(news_new)} news, +{len(apps_new)} apps, "
+        f"linkedin{'(' + '; '.join(li_changes) + ')' if li_changes else '=ok'}"
     )
     with open(RUN_LOG, "a", encoding="utf-8") as f:
         f.write(summary + "\n")
@@ -805,8 +893,13 @@ if __name__ == "__main__":
     ensure_dirs()
     if "--archive" in sys.argv:
         archive_step()
-    elif "--news" in sys.argv:
+    elif "--news" in sys.argv:        # periodic: news + apps + linkedin + republish
         fetch_news()
+        fetch_apps()
+        run_linkedin()
+        build_dashboard()
+    elif "--apps" in sys.argv:
+        fetch_apps()
         build_dashboard()
     else:
         main()

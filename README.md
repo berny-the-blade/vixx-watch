@@ -1,17 +1,35 @@
 # vixx-watch
 
-Daily change monitor for **vixx.vn** (Vixex). Runs at 00:00 UTC, records what
-changed, and snapshots every page to the Wayback Machine.
+Change monitor for **Vixex** — the website(s), news/social coverage, app
+stores, and LinkedIn. Runs on a Windows PC via scheduled tasks and publishes a
+shareable dashboard to GitHub Pages.
+
+**Live dashboard:** https://berny-the-blade.github.io/vixx-watch/
+**Build-progress chart:** https://berny-the-blade.github.io/vixx-watch/history.html
 
 ## What it tracks
-1. **New / removed pages** — crawled from `/vi`, `/en` and all internal links.
-2. **New / removed links** — every internal + external page link (assets/`_next`
-   chunks excluded so deploys don't create noise). Catches footer `#`
-   placeholders turning into real URLs.
-3. **Content updates** — per-page SHA-256 with Next.js build-id and chunk hashes
-   stripped, so a no-op redeploy is *not* flagged; a real text edit is.
-4. **Sitemap changes** — `sitemap.xml` is **absent today**; the monitor reports
-   if/when it appears, changes, or disappears (with added/removed `<loc>` URLs).
+1. **Website changes** on BOTH **vixx.vn** and **vixex.vn** (the latter is not
+   live yet — armed to catch it the moment it appears): new/removed pages,
+   new/removed links, per-page content edits (Next.js build-id + chunk hashes
+   stripped so redeploys aren't false positives), and sitemap.xml appear/change.
+2. **News & mentions** of Vixex + backers **FPT / FPT IS / GELEX** across
+   Vietnamese + English (Google News), Reddit, and VN crypto sites — each VN
+   headline shown with an **English translation**.
+3. **App stores** — Apple App Store (iTunes Search API) + Google Play for any
+   **VIX-named** crypto/trading app; flags newly-appeared apps.
+4. **LinkedIn** — vn.linkedin.com/company/vixex: name, tagline, **follower
+   count** (change-tracked).
+5. **Wayback snapshots** of every live page (spaced over the day).
+6. **History chart** — daily counts of live pages/links/news/apps over time.
+
+## Modules
+- `vixx_watch.py` — crawler, diff, news+translation, app stores, history,
+  Wayback queue/archiver, orchestration. Modes: *(none)*=daily crawl,
+  `--archive`, `--news`, `--apps`.
+- `dashboard.py` — renders `docs/index.html` (the console).
+- `chart.py` — renders `docs/history.html` (build-progress chart) from
+  `data/history.jsonl`.
+- `linkedin.py` — public LinkedIn company-page monitor → `data/linkedin.json`.
 
 ## Files written (under `data/`)
 | File | Contents |
