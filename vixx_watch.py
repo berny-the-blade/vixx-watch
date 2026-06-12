@@ -469,10 +469,15 @@ def reset_pending(pages):
 
 
 def archive_step(batch=ARCHIVE_BATCH):
-    """Archive up to `batch` still-pending pages for today; log results."""
+    """Archive up to `batch` still-pending pages; log results.
+
+    Drains whatever is pending regardless of the queue's date — so a page left
+    pending when the UTC day rolls over (e.g. an SPN 520) still gets retried by
+    the next archiver fire instead of being abandoned until the next crawl.
+    """
     q = load_pending()
-    if q.get("date") != today():
-        msg = f"{now_iso()} archive: no queue for today (crawl runs at 09:00)"
+    if not q.get("pages"):
+        msg = f"{now_iso()} archive: no queue yet (first crawl pending)"
         print(msg)
         return msg
     pending = [u for u, i in q["pages"].items() if i.get("status") != "OK"]
@@ -493,7 +498,7 @@ def archive_step(batch=ARCHIVE_BATCH):
     msg = (
         f"{now_iso()} archive: did {len(done)} "
         f"({', '.join(st for _, st, _ in done) or '-'}); "
-        f"{ok}/{len(q['pages'])} archived today, {remaining} pending"
+        f"{ok}/{len(q['pages'])} archived (queue {q.get('date','?')}), {remaining} pending"
     )
     with open(RUN_LOG, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
