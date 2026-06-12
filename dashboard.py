@@ -26,7 +26,7 @@ NEWS_LIMIT = 5         # visible at once (client-side toggle picks which 5)
 NEWS_POOL = 80         # items rendered hidden so the narrow toggle has material
 APPS_LIMIT = 25
 CHANGELOG_LIMIT = 5
-RECENT_DAYS = 3        # status banner window
+ALERT_WINDOW_DAYS = 1.2  # banner reflects only runs within ~a day (day-to-day)
 APP_NEW_DAYS = 7       # "NEW" badge window for apps
 
 
@@ -525,31 +525,36 @@ def render_links(state):
             '</summary><ul>%s</ul></details></section>' % (len(links), lis))
 
 
-def compute_banner(changelog, news, apps, now):
+def compute_banner(status, now):
+    """Banner from the LAST run's deltas (status.json) — green unless that run
+    actually found something new. Each category only counts if its run was
+    recent (so a stale category can't keep the banner red)."""
     reasons = []
-    # (a) non-baseline changelog entry in last RECENT_DAYS
-    site_change = False
-    for e in changelog:
-        if is_baseline_entry(e):
-            continue
-        if within_days(e.get("ts"), RECENT_DAYS, now):
-            site_change = True
-            break
-    if site_change:
-        reasons.append("site change")
-    # (b) news first_seen within window
-    n_news = sum(1 for i in news if within_days(i.get("first_seen"), RECENT_DAYS, now))
-    if n_news:
-        reasons.append("%d new article%s" % (n_news, "" if n_news == 1 else "s"))
-    n_apps = sum(1 for a in apps if within_days(a.get("first_seen"), RECENT_DAYS, now))
-    if n_apps:
-        reasons.append("%d new app%s" % (n_apps, "" if n_apps == 1 else "s"))
+
+    def fresh(cat):
+        e = status.get(cat) or {}
+        return e if within_days(e.get("ts"), ALERT_WINDOW_DAYS, now) else None
+
+    s = fresh("site")
+    if s and s.get("changed"):
+        reasons.append("site structure changed")
+    n = fresh("news")
+    if n and n.get("n", 0) > 0:
+        reasons.append("%d new article%s" % (n["n"], "" if n["n"] == 1 else "s"))
+    a = fresh("apps")
+    if a and a.get("n", 0) > 0:
+        reasons.append("%d new app%s" % (a["n"], "" if a["n"] == 1 else "s"))
+    se = fresh("securities")
+    if se and se.get("n", 0) > 0:
+        reasons.append("VIX Securities update")
+    li = fresh("linkedin")
+    if li and li.get("n", 0) > 0:
+        reasons.append("LinkedIn update")
+
     if reasons:
-        return ('<div class="banner alert">&#9888; Changes detected &mdash; %s'
-                ' (last %d days)</div>'
-                % (_e(", ".join(reasons)), RECENT_DAYS))
-    return ('<div class="banner ok">&#10003; No recent changes'
-            ' (last %d days)</div>' % RECENT_DAYS)
+        return ('<div class="banner alert">&#9888; New since last check &mdash; %s'
+                '</div>' % _e(", ".join(reasons)))
+    return '<div class="banner ok">&#10003; No changes since last check</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +582,9 @@ def build_dashboard():
     securities = _read_json(os.path.join(DATA_DIR, "securities.json"), {})
     if not isinstance(securities, dict):
         securities = {}
+    status = _read_json(os.path.join(DATA_DIR, "status.json"), {})
+    if not isinstance(status, dict):
+        status = {}
     changelog = parse_changelog(_read_text(os.path.join(DATA_DIR, "changelog.md")))
 
     # Sort news newest-first defensively (file is pre-sorted; keep stable).
@@ -602,7 +610,7 @@ def build_dashboard():
         stat("yes" if sitemap_present else "no", "sitemap"),
     ])
 
-    banner = compute_banner(changelog, news, apps, now)
+    banner = compute_banner(status, now)
 
     parts = []
     parts.append('<!doctype html><html lang="en"><head>')

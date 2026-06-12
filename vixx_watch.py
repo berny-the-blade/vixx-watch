@@ -819,15 +819,6 @@ def fetch_apps():
     return new
 
 
-def append_changelog(title, bullets):
-    """Append a dated alert section to changelog.md (shows in the dashboard feed)."""
-    if not bullets:
-        return
-    lines = [f"\n## {now_iso()}", f"\n### {title}"] + [f"- {b}" for b in bullets]
-    with open(CHANGELOG, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
 def fetch_securities():
     """Track VIX Securities' app(s); alert if a listing starts mentioning crypto."""
     prev = {}
@@ -890,8 +881,6 @@ def fetch_securities():
             alerts.append(f"VIX Securities app '{rec['name']}' NOW mentions crypto")
     with open(SEC_FILE, "w", encoding="utf-8") as f:
         json.dump(cur, f, ensure_ascii=False, indent=2)
-    if alerts:
-        append_changelog("VIX Securities watch", alerts)
     msg = (f"{now_iso()} securities: {len(cur)} app(s), "
            f"crypto={sum(1 for r in cur.values() if r['crypto'])}, +{len(alerts)} alert(s)")
     with open(RUN_LOG, "a", encoding="utf-8") as f:
@@ -920,6 +909,25 @@ def build_dashboard():
 
 # ---------------------------------------------------------------- history / linkedin
 HISTORY = os.path.join(DATA_DIR, "history.jsonl")
+STATUS_FILE = os.path.join(DATA_DIR, "status.json")  # per-run deltas for the banner
+
+
+def update_status(**cats):
+    """Record what each run actually found (deltas), so the dashboard banner can
+    reflect day-to-day change instead of cumulative counts. Each category gets a
+    fresh timestamp; categories a run didn't compute are left untouched."""
+    st = {}
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = {}
+    now = now_iso()
+    for key, val in cats.items():
+        st[key] = {"ts": now, **val}
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
 
 
 def _count_json_list(path):
@@ -996,6 +1004,11 @@ def main():
     sec_alerts = fetch_securities()
     li_changes = run_linkedin()
     record_history(pages, links, sitemap["present"])
+    update_status(
+        site={"changed": bool(changed and not d["first_run"])},
+        news={"n": len(news_new)}, apps={"n": len(apps_new)},
+        securities={"n": len(sec_alerts)}, linkedin={"n": len(li_changes)},
+    )
     build_dashboard()
 
     summary = (
@@ -1018,13 +1031,18 @@ if __name__ == "__main__":
     if "--archive" in sys.argv:
         archive_step()
     elif "--news" in sys.argv:        # periodic: news + apps + securities + linkedin
-        fetch_news()
-        fetch_apps()
-        fetch_securities()
-        run_linkedin()
+        news_new = fetch_news()
+        apps_new = fetch_apps()
+        sec_alerts = fetch_securities()
+        li_changes = run_linkedin()
+        update_status(
+            news={"n": len(news_new)}, apps={"n": len(apps_new)},
+            securities={"n": len(sec_alerts)}, linkedin={"n": len(li_changes)},
+        )
         build_dashboard()
     elif "--apps" in sys.argv:
-        fetch_apps()
+        apps_new = fetch_apps()
+        update_status(apps={"n": len(apps_new)})
         build_dashboard()
     else:
         main()
