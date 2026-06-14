@@ -263,6 +263,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
 .b.warn{background:rgba(210,153,34,.2);color:#e3c266}
 .b.alert{background:rgba(248,81,73,.2);color:#ffb4ae}
 .b.mut{background:#262a33;color:var(--mut)}
+.snap-fresh{color:#85e89d;font-size:12px}.snap-stale{color:var(--warn);font-size:12px}
 .chg{margin:0 0 14px}
 .chg:last-child{margin-bottom:0}
 .chg .ct{font-weight:600;font-size:13px}
@@ -471,7 +472,25 @@ def render_changelog(entries):
             % ("".join(blocks), older))
 
 
-def render_pages(state, wayback):
+_SNAP_RE = re.compile(r"/web/(\d{8})(\d{6})?")
+
+
+def _snap_date(archived_url, now):
+    """(label, stale) parsed from a Wayback capture URL; stale if >=2 days old."""
+    if not archived_url:
+        return ("", False)
+    m = _SNAP_RE.search(archived_url)
+    if not m:
+        return ("", False)
+    d = m.group(1)
+    try:
+        dt = datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]), tzinfo=timezone.utc)
+    except ValueError:
+        return ("", False)
+    return ("%s-%s-%s" % (d[0:4], d[4:6], d[6:8]), (now - dt).days >= 2)
+
+
+def render_pages(state, wayback, now):
     pages = state.get("pages") or {}
     wb_pages = (wayback.get("pages") or {}) if isinstance(wayback, dict) else {}
     if not pages:
@@ -483,12 +502,8 @@ def render_pages(state, wayback):
         wb = wb_pages.get(url) or {}
         wb_status = wb.get("status") or "—"
         archived = wb.get("archived") or ""
-        if wb_status == "OK" and archived:
-            snap = archived
-        else:
-            snap = WB_LATEST + url
+        snap = archived if (wb_status == "OK" and archived) else WB_LATEST + url
         hist = WB_HISTORY + url
-        # archive status badge
         if wb_status == "OK":
             sb = '<span class="b ok">OK</span>'
         elif wb_status == "pending":
@@ -497,6 +512,14 @@ def render_pages(state, wayback):
             sb = '<span class="b alert">%s</span>' % _e(wb_status)
         else:
             sb = '<span class="b mut">—</span>'
+        # actual Wayback capture date (reveals stale anonymous-SPN captures)
+        sdate, stale = _snap_date(archived, now)
+        if sdate:
+            cls = "snap-stale" if stale else "snap-fresh"
+            tip = " title='older than today — anonymous SPN returned a cached capture'" if stale else ""
+            date_cell = '<span class="%s"%s>%s</span>' % (cls, tip, sdate)
+        else:
+            date_cell = '<span class="b mut">—</span>'
         http = info.get("status")
         http_badge = ""
         if http is not None:
@@ -507,11 +530,11 @@ def render_pages(state, wayback):
             '<td>%s</td>'
             '<td><a href="%s" target="_blank" rel="noopener">snapshot</a> · '
             '<a href="%s" target="_blank" rel="noopener">history</a></td>'
-            '<td>%s</td></tr>'
-            % (_e(url), _e(url), http_badge, _e(snap), _e(hist), sb))
+            '<td>%s</td><td>%s</td></tr>'
+            % (_e(url), _e(url), http_badge, _e(snap), _e(hist), date_cell, sb))
     return ('<section class="card"><h2>Pages</h2>'
             '<table><thead><tr><th>URL</th><th>HTTP</th>'
-            '<th>Wayback</th><th>Archive (today)</th></tr></thead>'
+            '<th>Wayback</th><th>Snapshotted</th><th>Today</th></tr></thead>'
             '<tbody>%s</tbody></table></section>') % "".join(rows)
 
 
@@ -631,7 +654,7 @@ def build_dashboard():
     parts.append(render_apps(apps, now))
     parts.append(render_securities(securities, now))
     parts.append(render_changelog(changelog))
-    parts.append(render_pages(state, wayback))
+    parts.append(render_pages(state, wayback, now))
     parts.append(render_links(state))
     parts.append('<p class="foot">vixx-watch &middot; static monitoring console</p>')
     parts.append('</div></body></html>')
