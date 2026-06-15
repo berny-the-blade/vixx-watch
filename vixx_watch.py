@@ -136,6 +136,9 @@ APPS_LATEST = os.path.join(DATA_DIR, "apps_latest.json")
 SEC_FILE = os.path.join(DATA_DIR, "securities.json")   # VIX Securities app watch
 DOCS_DIR = os.path.join(BASE_DIR, "docs")          # GitHub Pages source
 DASHBOARD = os.path.join(DOCS_DIR, "index.html")
+# Optional archive.org S3 keys ("accesskey:secret") for authenticated SPN2 —
+# forces a FRESH capture each day (anonymous SPN dedups stale ones). Gitignored.
+WAYBACK_KEYS_FILE = os.path.join(BASE_DIR, "wayback_keys.txt")
 WB_LATEST = "https://web.archive.org/web/29991231235959/"  # redirects to newest capture
 WB_HISTORY = "https://web.archive.org/web/*/"               # capture calendar
 CHANGELOG = os.path.join(DATA_DIR, "changelog.md")
@@ -413,12 +416,71 @@ def write_changelog(d, new):
 
 
 # ---------------------------------------------------------------- wayback
+def _load_wayback_keys():
+    """Return (access, secret) from wayback_keys.txt, or None for anonymous."""
+    try:
+        with open(WAYBACK_KEYS_FILE, encoding="utf-8") as f:
+            line = f.read().strip()
+        if ":" in line:
+            a, s = line.split(":", 1)
+            if a.strip() and s.strip():
+                return a.strip(), s.strip()
+    except OSError:
+        pass
+    return None
+
+
+def _spn2_save(url, access, secret):
+    """Authenticated Save-Page-Now: forces a fresh capture, polls for the result.
+    Returns (status, archived_url)."""
+    hdr = {"Authorization": f"LOW {access}:{secret}", "Accept": "application/json",
+           "User-Agent": USER_AGENT}
+    body = urllib.parse.urlencode({
+        "url": url, "capture_all": "1", "skip_first_archive": "1",
+        "if_not_archived_within": "0",   # always make a new capture
+    }).encode()
+    req = urllib.request.Request("https://web.archive.org/save", data=body, method="POST",
+                                 headers={**hdr, "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return (f"ERR spn2 HTTP {e.code}", "")
+    except Exception as e:  # noqa: BLE001
+        return (f"ERR spn2 {e}", "")
+    job = resp.get("job_id")
+    if not job:
+        return (f"ERR spn2 {resp.get('status_ext') or resp.get('message') or resp}"[:90], "")
+    for _ in range(12):                  # poll up to ~12 * 8s
+        time.sleep(8)
+        sreq = urllib.request.Request("https://web.archive.org/save/status/" + job, headers=hdr)
+        try:
+            with urllib.request.urlopen(sreq, timeout=30) as r:
+                st = json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            continue
+        if st.get("status") == "success":
+            ts = st.get("timestamp", "")
+            ou = st.get("original_url") or url
+            return ("OK", f"https://web.archive.org/web/{ts}/{ou}")
+        if st.get("status") == "error":
+            return (f"ERR spn2 {st.get('status_ext') or st.get('message')}"[:90], "")
+    return ("ERR spn2 timeout", "")
+
+
 def wayback_one(url, attempts=1):
     """Try to archive one URL. Returns (status, archived).
 
-    attempts=1 (default) does a single gentle try — the scheduler spaces calls
-    over the day, so failures are simply retried on the next fire.
+    Uses authenticated SPN2 (fresh daily capture) when wayback_keys.txt exists;
+    otherwise anonymous Save-Page-Now (which may return a stale cached capture).
+    attempts=1 spaces retries across scheduler fires.
     """
+    keys = _load_wayback_keys()
+    if keys:
+        st, arch = _spn2_save(url, keys[0], keys[1])
+        if st == "OK":
+            return (st, arch)
+        print(f"{now_iso()} SPN2 failed ({st}); falling back to anonymous for {url}")
     save_url = "https://web.archive.org/save/" + url
     backoffs = [0, 30, 60][:max(1, attempts)]  # only back off if multiple attempts
     last = ("ERR none", "")
