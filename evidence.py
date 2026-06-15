@@ -49,8 +49,14 @@ import shutil
 import subprocess
 import urllib.request
 
-# Free RFC-3161 Time-Stamp Authority (trusted, independent, court-recognized).
-TSA_URL = "https://freetsa.org/tsr"
+# RFC-3161 Time-Stamp Authorities — each run is stamped by ALL of them, giving
+# independent, corroborating trusted timestamps. DigiCert = globally-trusted
+# commercial CA (court-familiar); freetsa = free community CA (self-verifiable
+# via evidence/tsa_certs/).
+TSAS = [
+    {"name": "digicert", "url": "http://timestamp.digicert.com"},
+    {"name": "freetsa", "url": "https://freetsa.org/tsr"},
+]
 
 # --- Constants (self-contained; do NOT import vixx_watch) -------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -246,15 +252,16 @@ def tsa_available():
     return bool(shutil.which("openssl"))
 
 
-def tsa_stamp(path, tsa_url=TSA_URL):
-    """RFC-3161 trusted timestamp: builds a SHA-256 timestamp request with openssl,
-    POSTs it to a free TSA, writes the signed token to <path>.tsr. Never raises.
-    The .tsr cryptographically binds the file's hash to an independent trusted
-    time (verifiable later with `openssl ts -verify`)."""
+def tsa_stamp(path, url, name):
+    """RFC-3161 trusted timestamp via `url`: builds a SHA-256 request with openssl,
+    POSTs it, writes the signed token to <path>.<name>.tsr. Never raises. The
+    token cryptographically binds the file's hash to an independent trusted time
+    (verify with `openssl ts -verify`)."""
     openssl = shutil.which("openssl")
     if not openssl:
         return False
-    tsq = path + ".tsq"
+    tsq = f"{path}.{name}.tsq"
+    out = f"{path}.{name}.tsr"
     try:
         q = subprocess.run(
             [openssl, "ts", "-query", "-data", path, "-sha256", "-cert",
@@ -265,16 +272,16 @@ def tsa_stamp(path, tsa_url=TSA_URL):
         with open(tsq, "rb") as f:
             body = f.read()
         req = urllib.request.Request(
-            tsa_url, data=body,
+            url, data=body,
             headers={"Content-Type": "application/timestamp-query",
                      "User-Agent": "vixx-watch"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             tsr = resp.read()
         if not tsr:
             return False
-        with open(path + ".tsr", "wb") as f:
+        with open(out, "wb") as f:
             f.write(tsr)
-        return os.path.getsize(path + ".tsr") > 0
+        return os.path.getsize(out) > 0
     except Exception:  # noqa: BLE001
         return False
     finally:
@@ -282,6 +289,13 @@ def tsa_stamp(path, tsa_url=TSA_URL):
             os.remove(tsq)
         except OSError:
             pass
+
+
+def tsa_stamp_all(path):
+    """Stamp `path` with every configured TSA. Returns list of (name, ok)."""
+    if not tsa_available():
+        return []
+    return [(t["name"], tsa_stamp(path, t["url"], t["name"])) for t in TSAS]
 
 
 def verify():

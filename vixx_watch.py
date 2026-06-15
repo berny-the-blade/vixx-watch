@@ -1275,13 +1275,13 @@ def seal_evidence(run_id, pages, hosts):
                                  for u, i in wb.get("pages", {}).items()},
         })
         runs_file = os.path.join(EVIDENCE_DIR, "runs", f"{entry['seq']}-{run_id}.json")
-        ts_kind = "none"
+        stamps = []
         if evidence.ots_available() and evidence.ots_stamp(runs_file):
-            ts_kind = "ots"
-        elif evidence.tsa_available() and evidence.tsa_stamp(runs_file):
-            ts_kind = "rfc3161"
+            stamps.append("ots")
+        stamps += [name for name, ok in evidence.tsa_stamp_all(runs_file) if ok]
         msg = (f"{now_iso()} evidence: run {entry['seq']} sealed, "
-               f"{len(entry.get('artifacts', []))} artifacts, timestamp={ts_kind}")
+               f"{len(entry.get('artifacts', []))} artifacts, "
+               f"timestamps={'+'.join(stamps) or 'none'}")
         with open(RUN_LOG, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
         print(msg)
