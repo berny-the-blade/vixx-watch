@@ -21,14 +21,40 @@ shareable dashboard to GitHub Pages.
    count** (change-tracked).
 5. **Wayback snapshots** of every live page (spaced over the day).
 6. **History chart** — daily counts of live pages/links/news/apps over time.
+7. **Forensic evidence capture** (court-grade) — see below.
+
+## Forensic evidence (court-grade, tamper-evident)
+Each crawl seals a complete, tamper-evident record into a **separate PRIVATE
+repo** (`Power-Trade/vixx-watch-evidence`, pushed every run — off-machine,
+GitHub-timestamped, access-restricted):
+- **Verbatim captures** per page/asset: raw response **bytes**, full HTTP
+  **headers** (Date/ETag/Last-Modified…), **redirect chain**, HTTP status.
+- **TLS certificate** per host (DER + fingerprint + validity dates) — documents
+  the site's cert state (vixx.vn's is expired).
+- **Full-page rendered screenshots** (headless Chromium) — what a human saw.
+- **Provenance** per run: tracker git commit, machine, OS/Python, config, and
+  that crawl TLS verification was disabled.
+- **Hash-chained manifest** (`manifest.jsonl` + `ledger.txt`): every artifact
+  SHA-256'd; each run's entry chains to the previous, so any later edit is
+  detectable. Verify: `python vixx_watch.py --verify`.
+- **Trusted timestamp**: each run's manifest is RFC-3161 timestamped by a free
+  TSA (`.tsr`), independently of the local clock (`ots`/OpenTimestamps is
+  attempted first but unavailable on this Windows/OpenSSL-3 setup).
+- **Wayback + GitHub** push times provide two further independent timestamp
+  witnesses.
+
+*Not legal advice — admissibility varies by jurisdiction; involve counsel and
+consider a neutral eDiscovery custodian for high-stakes use.*
 
 ## Modules
-- `vixx_watch.py` — crawler, diff, news+translation, app stores, history,
-  Wayback queue/archiver, orchestration. Modes: *(none)*=daily crawl,
-  `--archive`, `--news`, `--apps`.
+- `vixx_watch.py` — crawler, forensic capture, diff, news+translation, app
+  stores, history, Wayback queue/archiver, orchestration. Modes: *(none)*=daily
+  crawl, `--archive`, `--news`, `--apps`, `--verify`.
+- `evidence.py` — provenance + hash-chained manifest/ledger + `verify()` +
+  RFC-3161/OTS timestamping.
+- `screenshot.py` — Playwright/Chromium full-page screenshots.
 - `dashboard.py` — renders `docs/index.html` (the console).
-- `chart.py` — renders `docs/history.html` (build-progress chart) from
-  `data/history.jsonl`.
+- `chart.py` — renders `docs/history.html` (build-progress chart).
 - `linkedin.py` — public LinkedIn company-page monitor → `data/linkedin.json`.
 
 ## Files written (under `data/`)

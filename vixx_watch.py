@@ -145,6 +145,8 @@ CHANGELOG = os.path.join(DATA_DIR, "changelog.md")
 RUN_LOG = os.path.join(DATA_DIR, "run.log")
 WAYBACK_LOG = os.path.join(DATA_DIR, "wayback.log")
 SNAP_DIR = os.path.join(DATA_DIR, "snapshots")
+EVIDENCE_DIR = os.path.join(BASE_DIR, "evidence")          # separate private repo
+CAPTURES_DIR = os.path.join(EVIDENCE_DIR, "captures")      # per-run raw captures
 
 # Don't crawl these (assets / framework internals); still recorded as links.
 SKIP_CRAWL_RE = re.compile(
@@ -153,6 +155,14 @@ SKIP_CRAWL_RE = re.compile(
     re.I,
 )
 HREF_RE = re.compile(r'href="([^"]+)"')
+
+# Graphics/asset detection: hash the BYTES of each image so a same-URL change
+# (new pixels under the same filename) is caught, not just src changes.
+ASSET_CAP = 80                         # max assets fetched+hashed per run
+ASSET_EXT_RE = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|avif|bmp)(\?|$)", re.I)
+SRC_RE = re.compile(r'src="([^"]+)"')
+CSS_URL_RE = re.compile(r"url\((['\"]?)([^)'\"]+)\1\)")
+OG_IMG_RE = re.compile(r'(?:property|name)="og:image"[^>]*content="([^"]+)"')
 
 # Volatile per-deploy fingerprints to strip before hashing page content,
 # so a no-op redeploy doesn't look like a content change.
@@ -253,15 +263,170 @@ def snap_name(url):
     return re.sub(r"[^A-Za-z0-9]+", "_", url).strip("_")[:150] + ".html"
 
 
+def sha_bytes(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def fetch_bytes(url, timeout=FETCH_TIMEOUT):
+    """Fetch raw bytes (for hashing images). Returns (status, bytes)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as r:
+            data = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                try:
+                    data = gzip.decompress(data)
+                except OSError:
+                    pass
+            return r.status, data
+    except Exception:  # noqa: BLE001
+        return 0, b""
+
+
+def extract_assets(decoded, base):
+    """Internal image/graphic URLs referenced by a page (src, CSS url(), og:image)."""
+    found = set()
+    cands = (SRC_RE.findall(decoded)
+             + [m[1] for m in CSS_URL_RE.findall(decoded)]
+             + OG_IMG_RE.findall(decoded))
+    for raw in cands:
+        u = normalize(raw, base)
+        if not u or not is_internal(u):
+            continue
+        if "/_next/" in u:                 # skip Next.js image-optimizer wrappers
+            continue
+        if ASSET_EXT_RE.search(u):
+            found.add(u)
+    return found
+
+
+def capture_assets(urls, run_id):
+    """Fetch each graphic and store VERBATIM bytes + meta under
+    captures/<run_id>/assets/. Returns hashes {url: raw_sha256}."""
+    hashes = {}
+    adir = os.path.join(CAPTURES_DIR, run_id, "assets")
+    os.makedirs(adir, exist_ok=True)
+    for u in sorted(urls)[:ASSET_CAP]:
+        cap = fetch_capture(u)
+        if cap["status"] != 200 or not cap["raw"]:
+            continue
+        raw_sha = sha_bytes(cap["raw"])
+        hashes[u] = raw_sha
+        name = cap_name(u)
+        m = ASSET_EXT_RE.search(u)
+        ext = m.group(0).split("?")[0] if m else ""
+        try:
+            with open(os.path.join(adir, name + ext), "wb") as f:
+                f.write(cap["raw"])
+            with open(os.path.join(adir, name + ".meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"url": u, "final_url": cap["final_url"],
+                           "status": cap["status"], "headers": cap["headers"],
+                           "raw_sha256": raw_sha, "bytes": len(cap["raw"]),
+                           "fetched_at": now_iso()}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        time.sleep(0.3)
+    return hashes
+
+
+# ---------------------------------------------------------------- forensic capture
+def run_stamp():
+    """Compact UTC run id, e.g. 20260615T120003Z."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def cap_name(url):
+    return re.sub(r"[^A-Za-z0-9]+", "_", url).strip("_")[:150]
+
+
+class _RedirectRec(urllib.request.HTTPRedirectHandler):
+    def __init__(self):
+        super().__init__()
+        self.hops = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops.append({"code": code, "to": newurl})
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_capture(url, timeout=FETCH_TIMEOUT):
+    """Forensic fetch: verbatim bytes + full headers + redirect chain + status."""
+    rec = _RedirectRec()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_ctx), rec)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, identity"})
+    info = {"url": url, "final_url": url, "status": 0, "headers": {},
+            "redirects": [], "raw": b"", "body": b"", "text": "", "error": ""}
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            raw = r.read()
+            body = raw
+            if r.headers.get("Content-Encoding") == "gzip":
+                try:
+                    body = gzip.decompress(raw)
+                except OSError:
+                    body = raw
+            info.update(final_url=r.geturl(), status=getattr(r, "status", 200),
+                        headers=dict(r.headers.items()), redirects=rec.hops,
+                        raw=raw, body=body, text=body.decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        info.update(status=e.code, error=f"HTTP {e.code}",
+                    headers=dict((e.headers or {}).items()))
+    except Exception as e:  # noqa: BLE001
+        info.update(error=str(e))
+    return info
+
+
+def capture_tls(host, port=443):
+    """Capture the server's TLS certificate (DER bytes + parsed fields). The
+    expired vixx.vn cert is itself evidence. Returns (meta, der_bytes)."""
+    import socket
+    meta = {"host": host, "port": port, "error": ""}
+    try:
+        ctx = ssl._create_unverified_context()
+        with socket.create_connection((host, port), timeout=20) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                der = ss.getpeercert(binary_form=True) or b""
+                meta["tls_version"] = ss.version()
+                meta["cipher"] = ss.cipher()
+        meta["der_sha256"] = sha_bytes(der)
+        meta["der_len"] = len(der)
+        # Parse human-readable fields from the DER via openssl if available.
+        try:
+            pem = ssl.DER_cert_to_PEM_cert(der)
+            import subprocess
+            out = subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-issuer", "-dates",
+                 "-fingerprint", "-sha256"],
+                input=pem, capture_output=True, text=True, timeout=15)
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        meta[k.strip().lower().replace(" ", "_")] = v.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return meta, der
+    except Exception as e:  # noqa: BLE001
+        meta["error"] = str(e)
+        return meta, b""
+
+
 # ---------------------------------------------------------------- crawl
-def crawl():
-    """Return (pages, all_links). pages: {url: {hash, status, len}}."""
+def crawl(run_id):
+    """Crawl all reachable pages, storing VERBATIM captures (raw bytes + full
+    headers + redirect chain) under evidence/captures/<run_id>/pages/.
+    Returns (pages, all_links, asset_urls, hosts)."""
     pages = {}
     all_links = set()
+    asset_urls = set()
+    hosts = set()
     seen = set()
     queue = deque(SEEDS)
-    snap_day = os.path.join(SNAP_DIR, today())
-    os.makedirs(snap_day, exist_ok=True)
+    pdir = os.path.join(CAPTURES_DIR, run_id, "pages")
+    os.makedirs(pdir, exist_ok=True)
 
     while queue and len(pages) < MAX_PAGES:
         url = queue.popleft()
@@ -274,26 +439,37 @@ def crawl():
                 all_links.add(norm)  # external page link, worth tracking
             continue
 
-        final, status, text = fetch(norm)
-        final = normalize(final, SITE) or norm
+        cap = fetch_capture(norm)
+        final = normalize(cap["final_url"], SITE) or norm
         if final in pages:
             continue
-        if status != 200 or text.startswith("__ERROR__"):
+        if cap["status"] != 200 or not cap["raw"]:
             continue  # unreachable/404 (e.g. vixex.vn not live yet) -> not a live page
 
-        decoded = decode_payload(text)
-        # save raw snapshot
+        hosts.add(urllib.parse.urlparse(final).netloc)
+        decoded = decode_payload(cap["text"])
+        name = cap_name(final)
+        raw_sha = sha_bytes(cap["raw"])
         try:
-            with open(os.path.join(snap_day, snap_name(final)), "w",
+            with open(os.path.join(pdir, name + ".raw"), "wb") as f:
+                f.write(cap["raw"])
+            with open(os.path.join(pdir, name + ".meta.json"), "w",
                       encoding="utf-8") as f:
-                f.write(text)
+                json.dump({
+                    "url": norm, "final_url": final, "status": cap["status"],
+                    "redirects": cap["redirects"], "headers": cap["headers"],
+                    "raw_file": name + ".raw", "raw_sha256": raw_sha,
+                    "content_hash": sha(clean_for_hash(cap["text"])),
+                    "bytes": len(cap["raw"]), "fetched_at": now_iso(),
+                }, f, ensure_ascii=False, indent=2)
         except OSError:
             pass
 
         pages[final] = {
-            "hash": sha(clean_for_hash(text)),
-            "status": status,
-            "len": len(text),
+            "hash": sha(clean_for_hash(cap["text"])),  # change-detection hash
+            "raw_sha256": raw_sha,                       # integrity over raw bytes
+            "status": cap["status"], "len": len(cap["raw"]),
+            "capture": f"captures/{run_id}/pages/{name}.raw",
         }
 
         # discover links from anchors AND RSC payload
@@ -307,13 +483,14 @@ def crawl():
                 is_internal(link)
                 and not SKIP_CRAWL_RE.search(link)
                 and link not in seen
-                and status == 200
+                and cap["status"] == 200
             ):
                 queue.append(link)
 
+        asset_urls |= extract_assets(decoded, final)  # images/graphics on this page
         time.sleep(CRAWL_DELAY)
 
-    return pages, sorted(all_links)
+    return pages, sorted(all_links), asset_urls, hosts
 
 
 def check_sitemap():
@@ -349,6 +526,9 @@ def diff_state(old, new):
         if op[u].get("hash") and np_[u].get("hash") and op[u]["hash"] != np_[u]["hash"]:
             changed.append(u)
 
+    oa, na = old.get("assets", {}), new.get("assets", {})
+    changed_assets = sorted(u for u in set(oa) & set(na) if oa[u] != na[u])
+
     sm_notes = []
     if osm:
         if nsm["present"] and not osm.get("present"):
@@ -370,6 +550,9 @@ def diff_state(old, new):
         "content_changed": changed,
         "new_links": sorted(nl - ol),
         "removed_links": sorted(ol - nl),
+        "new_graphics": sorted(set(na) - set(oa)),
+        "removed_graphics": sorted(set(oa) - set(na)),
+        "changed_graphics": changed_assets,
         "sitemap": sm_notes,
         "first_run": not op and not osm,
     }
@@ -384,6 +567,9 @@ def has_changes(d):
             "content_changed",
             "new_links",
             "removed_links",
+            "new_graphics",
+            "removed_graphics",
+            "changed_graphics",
             "sitemap",
         )
     )
@@ -403,6 +589,9 @@ def write_changelog(d, new):
         ("Content changed", d["content_changed"]),
         ("New links", d["new_links"]),
         ("Removed links", d["removed_links"]),
+        ("New graphics", d["new_graphics"]),
+        ("Changed graphics", d["changed_graphics"]),
+        ("Removed graphics", d["removed_graphics"]),
     ]
     for title, items in sections:
         if items:
@@ -1034,9 +1223,78 @@ def run_linkedin():
         return []
 
 
+def seal_evidence(run_id, pages, hosts):
+    """Capture TLS + screenshots, seal copies of mutable state/logs, then write a
+    hash-chained manifest entry over EVERY artifact and OpenTimestamp it."""
+    import shutil
+    cap_dir = os.path.join(CAPTURES_DIR, run_id)
+
+    tdir = os.path.join(cap_dir, "tls")
+    os.makedirs(tdir, exist_ok=True)
+    for h in sorted(hosts):
+        meta, der = capture_tls(h)
+        try:
+            if der:
+                with open(os.path.join(tdir, h + ".der"), "wb") as f:
+                    f.write(der)
+            with open(os.path.join(tdir, h + ".json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    try:
+        import screenshot
+        if screenshot.available():
+            screenshot.capture(sorted(pages), os.path.join(cap_dir, "screenshots"))
+    except Exception as e:  # noqa: BLE001
+        print(f"{now_iso()} screenshot failed: {e}")
+
+    # Seal copies of the mutable state/logs so this run's manifest covers them.
+    sdir = os.path.join(cap_dir, "state")
+    os.makedirs(sdir, exist_ok=True)
+    for p in (STATE_FILE, CHANGELOG, RUN_LOG, WAYBACK_LOG, NEWS_LOG, APPS_LOG,
+              SEC_FILE, NEWS_SEEN, APPS_SEEN, HISTORY, PENDING_FILE, STATUS_FILE,
+              os.path.join(DATA_DIR, "linkedin.json"),
+              os.path.join(DATA_DIR, "linkedin_changes.md"),
+              os.path.join(DATA_DIR, "news_latest.json"),
+              os.path.join(DATA_DIR, "apps_latest.json")):
+        if os.path.exists(p):
+            try:
+                shutil.copy2(p, os.path.join(sdir, os.path.basename(p)))
+            except OSError:
+                pass
+
+    try:
+        import evidence
+        artifacts = [os.path.join(root, fn)
+                     for root, _, files in os.walk(cap_dir) for fn in files]
+        wb = load_pending()
+        entry = evidence.record_run("crawl", artifacts, extra={
+            "run_id": run_id, "ts": now_iso(), "page_count": len(pages),
+            "wayback_captures": {u: i.get("archived", "")
+                                 for u, i in wb.get("pages", {}).items()},
+        })
+        runs_file = os.path.join(EVIDENCE_DIR, "runs", f"{entry['seq']}-{run_id}.json")
+        ts_kind = "none"
+        if evidence.ots_available() and evidence.ots_stamp(runs_file):
+            ts_kind = "ots"
+        elif evidence.tsa_available() and evidence.tsa_stamp(runs_file):
+            ts_kind = "rfc3161"
+        msg = (f"{now_iso()} evidence: run {entry['seq']} sealed, "
+               f"{len(entry.get('artifacts', []))} artifacts, timestamp={ts_kind}")
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+        print(msg)
+        return entry
+    except Exception as e:  # noqa: BLE001
+        print(f"{now_iso()} evidence sealing failed: {e}")
+        return None
+
+
 # ---------------------------------------------------------------- main
 def main():
     ensure_dirs()
+    run_id = run_stamp()
     start = now_iso()
 
     old = {}
@@ -1047,9 +1305,11 @@ def main():
         except (OSError, ValueError):
             old = {}
 
-    pages, links = crawl()
+    pages, links, asset_urls, hosts = crawl(run_id)
+    assets = capture_assets(asset_urls, run_id)
     sitemap = check_sitemap()
-    new = {"pages": pages, "links": links, "sitemap": sitemap, "crawled_at": start}
+    new = {"pages": pages, "links": links, "assets": assets,
+           "sitemap": sitemap, "crawled_at": start, "run_id": run_id}
 
     d = diff_state(old, new)
     changed = has_changes(d)
@@ -1072,13 +1332,15 @@ def main():
         securities={"n": len(sec_alerts)}, linkedin={"n": len(li_changes)},
     )
     build_dashboard()
+    seal_evidence(run_id, pages, hosts)  # TLS + screenshots + hash-chained manifest + OTS
 
     summary = (
         f"{now_iso()} pages={len(pages)} links={len(links)} "
         f"sitemap={'Y' if sitemap['present'] else 'N'} "
         f"changed={'YES' if changed else 'no'} "
         f"(+{len(d['new_pages'])}p/{len(d['content_changed'])}c/"
-        f"{len(d['new_links'])}l) queued {len(pages)} for archive, "
+        f"{len(d['new_links'])}l/{len(d['changed_graphics'])}g) "
+        f"{len(assets)} graphics, queued {len(pages)} for archive, "
         f"+{len(news_new)} news, +{len(apps_new)} apps, "
         f"+{len(sec_alerts)} sec-alerts, "
         f"linkedin{'(' + '; '.join(li_changes) + ')' if li_changes else '=ok'}"
@@ -1106,5 +1368,8 @@ if __name__ == "__main__":
         apps_new = fetch_apps()
         update_status(apps={"n": len(apps_new)})
         build_dashboard()
+    elif "--verify" in sys.argv:      # re-hash all evidence + walk the chain
+        import evidence
+        print(json.dumps(evidence.verify(), indent=2))
     else:
         main()

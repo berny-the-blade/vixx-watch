@@ -1,4 +1,6 @@
 data/
+evidence/
 __pycache__/
 *.pyc
 wayback_keys.txt
+_shottest/

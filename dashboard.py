@@ -627,6 +627,7 @@ def build_dashboard():
     stats_html = "".join([
         stat(len(state.get("pages") or {}), "pages"),
         stat(len(state.get("links") or []), "links"),
+        stat(len(state.get("assets") or {}), "graphics"),
         stat(len(news), "news"),
         stat(len(apps), "apps"),
         stat(li_followers if li_followers is not None else "—", "followers"),

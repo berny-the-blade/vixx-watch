@@ -16,15 +16,30 @@ if     ($Archive) { & $Py "$Dir\vixx_watch.py" --archive }
 elseif ($News)    { & $Py "$Dir\vixx_watch.py" --news }
 else              { & $Py "$Dir\vixx_watch.py" }
 
+$stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+
 # Publish the dashboard only if it actually changed.
 git -C $Dir add docs 2>$null
-$dirty = git -C $Dir status --porcelain docs
-if ($dirty) {
-    $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+if (git -C $Dir status --porcelain docs) {
     git -C $Dir -c user.name="Bernd Sischka" -c user.email="bernd@power.trade" `
         commit -q -m "dashboard update $stamp" 2>&1 | Out-Null
     git -C $Dir push -q origin main 2>&1 | Out-Null
     Write-Host "published dashboard ($stamp)"
 } else {
     Write-Host "no dashboard change to publish"
+}
+
+# Push the forensic evidence repo (separate PRIVATE repo) — off-machine,
+# GitHub-timestamped witness of the captures + manifest + OTS proofs.
+$Ev = Join-Path $Dir "evidence"
+if (Test-Path (Join-Path $Ev ".git")) {
+    git -C $Ev add -A 2>$null
+    if (git -C $Ev status --porcelain) {
+        git -C $Ev -c user.name="Bernd Sischka" -c user.email="bernd@power.trade" `
+            commit -q -m "evidence $stamp" 2>&1 | Out-Null
+        git -C $Ev push -q origin main 2>&1 | Out-Null
+        Write-Host "pushed evidence ($stamp)"
+    } else {
+        Write-Host "no new evidence to push"
+    }
 }
