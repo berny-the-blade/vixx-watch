@@ -42,7 +42,8 @@ CRAWL_DELAY = 1.0          # seconds between page fetches (polite)
 FETCH_TIMEOUT = 30
 WAYBACK_TIMEOUT = 180      # Save-Page-Now blocks until capture completes
 WAYBACK_DELAY = 6.0        # seconds between Save-Page-Now calls (rate limit)
-ARCHIVE_BATCH = 1          # pages archived per --archive run (spaced by scheduler)
+ARCHIVE_BATCH = 8          # attempt ALL pending pages each fire (authenticated SPN2;
+                           # failures stay pending and retry next fire, no starvation)
 
 # ---- news / mentions monitoring ----
 NEWS_KEEP = 80             # articles kept in the dashboard feed
@@ -666,10 +667,14 @@ def wayback_one(url, attempts=1):
     """
     keys = _load_wayback_keys()
     if keys:
+        # Authenticated SPN2 forces a FRESH capture. Do NOT fall back to anonymous
+        # on failure — anonymous returns a stale cached capture and would record an
+        # old date as "OK". Return the error so the archiver keeps it pending and
+        # retries next fire until a genuinely fresh capture succeeds.
         st, arch = _spn2_save(url, keys[0], keys[1])
-        if st == "OK":
-            return (st, arch)
-        print(f"{now_iso()} SPN2 failed ({st}); falling back to anonymous for {url}")
+        if st != "OK":
+            print(f"{now_iso()} SPN2 not fresh for {url} ({st}); keeping pending")
+        return (st, arch)
     save_url = "https://web.archive.org/save/" + url
     backoffs = [0, 30, 60][:max(1, attempts)]  # only back off if multiple attempts
     last = ("ERR none", "")
