@@ -247,9 +247,22 @@ def ots_stamp(path):
     return out.returncode == 0 and os.path.exists(path + ".ots")
 
 
+def _openssl():
+    """Resolve the openssl executable. Scheduled tasks often don't have Git's
+    openssl on PATH, so check common Windows locations too."""
+    found = shutil.which("openssl")
+    if found:
+        return found
+    for c in (r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+              r"C:\Program Files\Git\usr\bin\openssl.exe"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def tsa_available():
-    """True if the openssl CLI is present (needed to build RFC-3161 requests)."""
-    return bool(shutil.which("openssl"))
+    """True if the openssl CLI is resolvable (needed to build RFC-3161 requests)."""
+    return bool(_openssl())
 
 
 def tsa_stamp(path, url, name):
@@ -257,7 +270,7 @@ def tsa_stamp(path, url, name):
     POSTs it, writes the signed token to <path>.<name>.tsr. Never raises. The
     token cryptographically binds the file's hash to an independent trusted time
     (verify with `openssl ts -verify`)."""
-    openssl = shutil.which("openssl")
+    openssl = _openssl()
     if not openssl:
         return False
     tsq = f"{path}.{name}.tsq"
