@@ -248,6 +248,17 @@ def is_internal(url):
         return False
 
 
+def locale_mirrors(url):
+    """Other-locale variants of a URL (the site has /vi/* and /en/* versions but
+    only links the active locale, so we must probe the mirror explicitly)."""
+    out = []
+    for a, b in (("/vi/", "/en/"), ("/en/", "/vi/")):
+        p = urllib.parse.urlparse(url)
+        if p.path.startswith(a):
+            out.append(url.replace(a, b, 1))
+    return out
+
+
 def clean_for_hash(text):
     for rx in NOISE_RES:
         text = rx.sub("", text)
@@ -430,7 +441,8 @@ def crawl(run_id, prior_urls=()):
     hosts = set()
     status_map = {}
     seen = set()
-    queue = deque(list(SEEDS) + [u for u in prior_urls])
+    queue = deque(list(SEEDS) + list(prior_urls)
+                  + [m for u in prior_urls for m in locale_mirrors(u)])
     pdir = os.path.join(CAPTURES_DIR, run_id, "pages")
     os.makedirs(pdir, exist_ok=True)
 
@@ -501,6 +513,9 @@ def crawl(run_id, prior_urls=()):
                 and cap["status"] == 200
             ):
                 queue.append(link)
+                for mir in locale_mirrors(link):  # also capture the other locale
+                    if mir not in seen:
+                        queue.append(mir)
 
         asset_urls |= extract_assets(decoded, final)  # images/graphics on this page
         time.sleep(CRAWL_DELAY)
