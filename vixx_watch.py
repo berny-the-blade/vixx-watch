@@ -1326,8 +1326,44 @@ def seal_evidence(run_id, pages, hosts):
 
 
 # ---------------------------------------------------------------- main
+LOCK_FILE = os.path.join(DATA_DIR, ".crawl.lock")
+LOCK_STALE_SEC = 1800   # ignore a lock older than 30 min (crashed prior run)
+
+
+def _acquire_lock():
+    """Single-instance guard: prevent concurrent crawls racing on state/queue/
+    evidence. Returns True if acquired."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            age = time.time() - os.path.getmtime(LOCK_FILE)
+            if age < LOCK_STALE_SEC:
+                return False
+        with open(LOCK_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()} {now_iso()}")
+        return True
+    except OSError:
+        return True  # if the lock FS op fails, don't block the run
+
+
+def _release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 def main():
     ensure_dirs()
+    if not _acquire_lock():
+        print(f"{now_iso()} crawl skipped: another run is in progress (lock held)")
+        return
+    try:
+        _crawl_run()
+    finally:
+        _release_lock()
+
+
+def _crawl_run():
     run_id = run_stamp()
     start = now_iso()
 
