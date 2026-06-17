@@ -416,16 +416,21 @@ def capture_tls(host, port=443):
 
 
 # ---------------------------------------------------------------- crawl
-def crawl(run_id):
+def crawl(run_id, prior_urls=()):
     """Crawl all reachable pages, storing VERBATIM captures (raw bytes + full
     headers + redirect chain) under evidence/captures/<run_id>/pages/.
-    Returns (pages, all_links, asset_urls, hosts)."""
+    Also re-attempts every previously-known page (prior_urls) so a page whose
+    linker is down is still checked. Returns (pages, all_links, asset_urls,
+    hosts, status_map) where status_map[url] = last HTTP status (0 = unreachable)
+    for every internal page attempted — lets the caller tell a real 404 (genuinely
+    removed) from a transient timeout (carry forward, NOT removed)."""
     pages = {}
     all_links = set()
     asset_urls = set()
     hosts = set()
+    status_map = {}
     seen = set()
-    queue = deque(SEEDS)
+    queue = deque(list(SEEDS) + [u for u in prior_urls])
     pdir = os.path.join(CAPTURES_DIR, run_id, "pages")
     os.makedirs(pdir, exist_ok=True)
 
@@ -449,6 +454,8 @@ def crawl(run_id):
             time.sleep(5)
             cap = fetch_capture(norm)
         final = normalize(cap["final_url"], SITE) or norm
+        status_map[norm] = cap["status"]
+        status_map[final] = cap["status"]
         if final in pages:
             continue
         if cap["status"] != 200 or not cap["raw"]:
@@ -498,7 +505,7 @@ def crawl(run_id):
         asset_urls |= extract_assets(decoded, final)  # images/graphics on this page
         time.sleep(CRAWL_DELAY)
 
-    return pages, sorted(all_links), asset_urls, hosts
+    return pages, sorted(all_links), asset_urls, hosts, status_map
 
 
 def check_sitemap():
@@ -1317,21 +1324,42 @@ def main():
         except (OSError, ValueError):
             old = {}
 
-    pages, links, asset_urls, hosts = crawl(run_id)
-
-    # Degraded-crawl guard: if we reached far fewer pages than last time, the
-    # site/network was flaky (timeouts) — do NOT overwrite good state or log
-    # false "removed" pages. Keep prior state and retry on the next run.
     old_pages = old.get("pages", {})
-    if old_pages and len(pages) < (len(old_pages) + 1) // 2:
-        msg = (f"{now_iso()} crawl DEGRADED: reached {len(pages)}/{len(old_pages)} "
-               f"pages (site/network flaky) — kept previous state, skipped diff")
+    pages, links, asset_urls, hosts, status_map = crawl(run_id, prior_urls=list(old_pages))
+
+    # Total-outage guard: if NOTHING was reachable (network/DNS down) but we knew
+    # pages before, abort without touching state — retry next run.
+    if old_pages and not pages:
+        msg = f"{now_iso()} crawl ABORTED: 0/{len(old_pages)} pages reachable (outage) — state untouched"
         with open(RUN_LOG, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
         print(msg)
         return
 
+    # Carry-forward: a previously-known page missing this run is only "removed"
+    # if it returned a real 4xx. Timeouts/5xx/unreached -> keep its prior record
+    # (marked unreachable) so a flaky network never logs a false removal.
+    carried = 0
+    for u, prev in old_pages.items():
+        if u in pages:
+            continue
+        st = status_map.get(u, 0)
+        if 400 <= st < 500:
+            continue  # genuine removal -> let diff flag it
+        pages[u] = {**prev, "unreachable_run": run_id, "unreachable_status": st}
+        carried += 1
+    if carried:
+        m = f"{now_iso()} carried forward {carried} transiently-unreachable page(s)"
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            f.write(m + "\n")
+        print(m)
+
     assets = capture_assets(asset_urls, run_id)
+    # Same carry-forward for graphics: keep prior asset hashes that weren't
+    # re-fetched this run (transient) so we don't log false "removed graphics".
+    for u, h in (old.get("assets") or {}).items():
+        if u not in assets:
+            assets[u] = h
     sitemap = check_sitemap()
     new = {"pages": pages, "links": links, "assets": assets,
            "sitemap": sitemap, "crawled_at": start, "run_id": run_id}
