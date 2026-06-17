@@ -441,6 +441,13 @@ def crawl(run_id):
             continue
 
         cap = fetch_capture(norm)
+        # Retry transient failures (timeouts / 5xx) before giving up — a single
+        # flaky fetch must NOT make a live page look "removed".
+        for _ in range(3):
+            if cap["status"] == 200 or (400 <= cap["status"] < 500):
+                break  # success, or a definitive 4xx (genuinely gone) -> stop
+            time.sleep(5)
+            cap = fetch_capture(norm)
         final = normalize(cap["final_url"], SITE) or norm
         if final in pages:
             continue
@@ -1311,6 +1318,19 @@ def main():
             old = {}
 
     pages, links, asset_urls, hosts = crawl(run_id)
+
+    # Degraded-crawl guard: if we reached far fewer pages than last time, the
+    # site/network was flaky (timeouts) — do NOT overwrite good state or log
+    # false "removed" pages. Keep prior state and retry on the next run.
+    old_pages = old.get("pages", {})
+    if old_pages and len(pages) < (len(old_pages) + 1) // 2:
+        msg = (f"{now_iso()} crawl DEGRADED: reached {len(pages)}/{len(old_pages)} "
+               f"pages (site/network flaky) — kept previous state, skipped diff")
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+        print(msg)
+        return
+
     assets = capture_assets(asset_urls, run_id)
     sitemap = check_sitemap()
     new = {"pages": pages, "links": links, "assets": assets,
