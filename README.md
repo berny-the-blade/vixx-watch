@@ -4,8 +4,8 @@ Change monitor for **Vixex** — the website(s), news/social coverage, app
 stores, and LinkedIn. Runs on a Windows PC via scheduled tasks and publishes a
 shareable dashboard to GitHub Pages.
 
-**Live dashboard:** https://berny-the-blade.github.io/vixx-watch/
-**Build-progress chart:** https://berny-the-blade.github.io/vixx-watch/history.html
+**Live dashboard:** https://harmonious-bublanina-d85bf4.netlify.app (hosted on Netlify; GitHub Pages disabled)
+**Build-progress chart:** https://harmonious-bublanina-d85bf4.netlify.app/history.html
 
 ## What it tracks
 1. **Website changes** on BOTH **vixx.vn** and **vixex.vn** (the latter is not
@@ -94,11 +94,13 @@ dashboard newest-first with source + language.
   `data/news_latest.json` (feed). **Note:** social platforms beyond Reddit
   (X/Twitter, Facebook, TikTok) need paid APIs / handles and are not scraped.
 
-## Web dashboard (GitHub Pages)
-Public URL: **https://berny-the-blade.github.io/vixx-watch/** — share with anyone.
+## Web dashboard (Netlify)
+Public URL: **https://harmonious-bublanina-d85bf4.netlify.app** — share with anyone.
+(Moved off GitHub Pages to avoid Pages-build Actions billing; rename the site in
+the Netlify UI if you want a tidier URL.)
 
-Each scheduled run regenerates `docs/index.html` and pushes it, so the page
-auto-updates. It shows:
+Each daily-crawl / news run regenerates `docs/index.html` and `netlify deploy`s it
+(the 2-hourly archive runs don't redeploy). It shows:
 - a **banner** (green = no changes / red = changes detected) — the "alert",
 - a **Recent changes** feed (new/removed pages, new/removed links, content
   edits, sitemap changes) with clickable links,
