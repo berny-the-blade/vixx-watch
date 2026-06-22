@@ -18,15 +18,22 @@ else              { & $Py "$Dir\vixx_watch.py" }
 
 $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
 
-# Publish the dashboard only if it actually changed.
-git -C $Dir add docs 2>$null
-if (git -C $Dir status --porcelain docs) {
-    git -C $Dir -c user.name="Bernd Sischka" -c user.email="bernd@power.trade" `
-        commit -q -m "dashboard update $stamp" 2>&1 | Out-Null
-    git -C $Dir push -q origin main 2>&1 | Out-Null
-    Write-Host "published dashboard ($stamp)"
+# Publish the dashboard to GitHub Pages ONLY on the daily crawl and news runs.
+# The 2-hourly archive runs are skipped: each docs push triggers a Pages
+# "build and deployment" Action, and the dashboard barely changes between
+# archive steps. This cuts Pages builds from ~15-19/day to ~5/day.
+if ($Archive) {
+    Write-Host "archive run: skipping dashboard push (reduces Pages builds)"
 } else {
-    Write-Host "no dashboard change to publish"
+    git -C $Dir add docs 2>$null
+    if (git -C $Dir status --porcelain docs) {
+        git -C $Dir -c user.name="Bernd Sischka" -c user.email="bernd@power.trade" `
+            commit -q -m "dashboard update $stamp" 2>&1 | Out-Null
+        git -C $Dir push -q origin main 2>&1 | Out-Null
+        Write-Host "published dashboard ($stamp)"
+    } else {
+        Write-Host "no dashboard change to publish"
+    }
 }
 
 # Push the forensic evidence repo (separate PRIVATE repo) — off-machine,
